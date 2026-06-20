@@ -705,30 +705,29 @@ Each entry is (ROOM-ID [NAME AREA COUNT STREAMERS]).")
       (string-join (nreverse names) " "))))
 
 (defun gikopoi-update-room-list (rooms)
-  "Update `gikopoi-room-list-data' and `gikopoi--room-user-counts' from the ROOMS vector."
+  "Rebuild `gikopoi-room-list-data' and `gikopoi--room-user-counts' from ROOMS vector."
   (clrhash gikopoi--room-user-counts)
+  (setq gikopoi-room-list-data nil)
   (seq-doseq (room rooms)
     (condition-case err
         (let-alist room
           (when .id
-            (let* ((id      .id)
-                   (n       (if (numberp .userCount) .userCount 0))
-                   (count   (number-to-string n))
-                   (streams (or (gikopoi--streamer-display .streams) ""))
-                   (entry   (assoc id gikopoi-room-list-data)))
+            (let* ((id         .id)
+                   (room-group .group)
+                   (n          (if (numberp .userCount) .userCount 0))
+                   (count      (number-to-string n))
+                   (streams    (or (gikopoi--streamer-display .streams) "")))
               (puthash id n gikopoi--room-user-counts)
               (let-alist gikopoi-lang-alist
                 (let* ((name (cdr (assoc id .room #'string-equal)))
                        (name (or (and (consp name) (cdr (assq 'sort_key name))) name id))
-                       (area (cdr (assoc .group .area #'string-equal)))
-                       (area (or (and (consp area) (cdr (assq 'sort_key area))) area .group)))
-                  (if entry
-                      (setf (aref (cadr entry) 2) count
-                            (aref (cadr entry) 3) streams)
-                    (push (list id (vector name area count streams))
-                          gikopoi-room-list-data)))))))
+                       (area (cdr (assoc room-group .area #'string-equal)))
+                       (area (or (and (consp area) (cdr (assq 'sort_key area))) area room-group)))
+                  (push (list id (vector name area count streams))
+                        gikopoi-room-list-data))))))
       (error
-       (message "Gikopoi: skipping bad room entry: %s" (error-message-string err))))))
+       (message "Gikopoi: skipping bad room entry: %s" (error-message-string err)))))
+  (setq gikopoi-room-list-data (nreverse gikopoi-room-list-data)))
 
 (defun gikopoi--busiest-room-id ()
   "Return the room ID with the most users, excluding the current room."
@@ -778,6 +777,11 @@ Each entry is (ROOM-ID [NAME AREA COUNT STREAMERS]).")
     (setq tabulated-list-format
           [("Room" 32 t) ("Area" 14 t) ("Users" 6 t) ("Streams" 0 nil)])
     (tabulated-list-init-header)
+    (add-hook 'tabulated-list-revert-hook
+              (lambda ()
+                (setq tabulated-list-entries gikopoi-room-list-data)
+                (gikopoi-room-list-request))
+              nil t)
     (gikopoi-room-list-mode)))
 
 (defun gikopoi--refresh-room-list-buffer ()
@@ -1042,10 +1046,24 @@ Requests a fresh room list from the server first."
           (lambda () (insert (format gikopoi-autoquote-format q)))
         (call-interactively #'gikopoi-send-message)))))
 
-(defun gikopoi-rula (room)
-  "Teleport to ROOM."
-  (interactive (list (completing-read "Room: " (mapcar #'car gikopoi-room-list-data))))
-  (gikopoi-change-room room))
+(defun gikopoi-rula (&optional room-id)
+  "Teleport to ROOM-ID, or prompt with the room list.
+When called with a string (e.g. via #rula), warp directly to that room ID.
+When called interactively, fetch the room list first if needed, then prompt."
+  (interactive
+   (list
+    (progn
+      (when (null gikopoi-room-list-data)
+        (gikopoi-room-list-request)
+        (user-error "Fetching room list — press r again in a moment"))
+      (let* ((candidates
+              (mapcar (lambda (e)
+                        (let* ((id (car e)) (v (cadr e)))
+                          (cons (format "%-32s [%s users]" (aref v 0) (aref v 2)) id)))
+                      gikopoi-room-list-data))
+             (choice (completing-read "Room: " (mapcar #'car candidates) nil t)))
+        (cdr (assoc choice candidates))))))
+  (when room-id (gikopoi-change-room room-id)))
 
 (defun gikopoi-send-message ()
   "Prompt for a message.
