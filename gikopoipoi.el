@@ -182,21 +182,13 @@
 (defvar gikopoi--auto-move-on-join-p nil
   "When non-nil, auto-move to the busiest room after the first room list arrives.")
 
-(defvar gikopoi--auto-move-area nil
-  "Area group to filter when auto-moving to the busiest room.")
-
-(defvar gikopoi-room-groups nil
-  "Alist mapping room-id to area group-id, populated by `server-room-list'.")
-
-(defun gikopoi--busiest-room-in-group (group)
-  "Return the room-id with the most users in GROUP from the last room list."
+(defun gikopoi--find-busiest-room ()
+  "Return the room-id with the most users from the last server-room-list."
   (let (best-id (best-count -1))
     (dolist (entry gikopoi-room-list-data)
-      (let* ((id    (car entry))
-             (count (string-to-number (aref (cadr entry) 2)))
-             (grp   (cdr (assoc id gikopoi-room-groups))))
-        (when (and (or (null group) (equal grp group)) (> count best-count))
-          (setq best-id id best-count count))))
+      (let ((count (string-to-number (aref (cadr entry) 2))))
+        (when (> count best-count)
+          (setq best-id (car entry) best-count count))))
     best-id))
 
 
@@ -291,8 +283,10 @@ Uses wss:// on port 443, ws:// otherwise."
          (t (message "Gikopoi: unrecognized packet %s %s" id payload))))
     (error
      (let ((msg (error-message-string err)))
-       (unless (string-match-p "No usable sound device driver found" msg)
-         (message "Gikopoi: websocket error: %s" msg))))))
+       (unless (or (string-match-p "No usable sound device driver found" msg)
+                   (string-match-p "not connected" msg))
+         (message "Gikopoi: handler error [%s]: %s"
+                  (ignore-errors (aref payload 0)) msg))))))
 
 (defun gikopoi-socket-emit (object)
   (if (and gikopoi-socket (websocket-openp gikopoi-socket))
@@ -359,9 +353,7 @@ Uses wss:// on port 443, ws:// otherwise."
 
 (defun gikopoi-connect (server port area room name character password)
   (setq gikopoi--deliberately-quit nil
-        gikopoi-room-list-data nil
-        gikopoi-room-groups nil
-        gikopoi--auto-move-area area)
+        gikopoi-room-list-data nil)
   (when (timerp gikopoi--reconnect-timer)
     (cancel-timer gikopoi--reconnect-timer))
   (when (and (boundp 'gikopoi-socket) (websocket-openp gikopoi-socket))
@@ -544,37 +536,53 @@ Uses wss:// on port 443, ws:// otherwise."
 (defvar gikopoi-room-list-data nil)
 (defvar gikopoi--show-room-list-p nil)
 
+(defun gikopoi--streamer-string (streamers)
+  "Convert STREAMERS (array of strings or objects) to a display string."
+  (when (and streamers (not (eq streamers 'json-null)))
+    (let (names)
+      (seq-doseq (s streamers)
+        (cond
+         ((stringp s) (push s names))
+         ((and (listp s) (alist-get 'userId s)) (push (alist-get 'userId s) names))
+         ((and (listp s) (alist-get 'publicUserId s)) (push (alist-get 'publicUserId s) names))))
+      (string-join (nreverse names) " "))))
+
 (defun gikopoi-update-room-list (rooms)
   (seq-doseq (room rooms)
-    (let-alist room
-      (let* ((id .id)
-             (count (number-to-string .userCount))
-             (streams (string-join .streamers " "))
-             (entry (assoc id gikopoi-room-list-data)))
-        ;; track group for busiest-room lookup
-        (setf (alist-get id gikopoi-room-groups nil nil #'equal) .group)
-        (let-alist gikopoi-lang-alist
-          (let* ((name (cdr (assoc id .room #'string-equal)))
-                 (name (or (when (consp name) (cdr (assq 'sort_key name))) name id))
-                 (area (cdr (assoc .group .area #'string-equal)))
-                 (area (or (when (consp area) (cdr (assq 'sort_key area))) area .group)))
-            (if (null entry)
-                (push (list id (vector name area count streams)) gikopoi-room-list-data)
-              (setf (aref (cadr entry) 2) count
-                    (aref (cadr entry) 3) streams))))))))
+    (condition-case err
+        (let-alist room
+          (when .id
+            (let* ((id    .id)
+                   (count (number-to-string (if (numberp .userCount) .userCount 0)))
+                   (streams (or (gikopoi--streamer-string .streamers) ""))
+                   (entry (assoc id gikopoi-room-list-data)))
+              (let-alist gikopoi-lang-alist
+                (let* ((name (cdr (assoc id .room #'string-equal)))
+                       (name (or (when (consp name) (cdr (assq 'sort_key name))) name id))
+                       (area (cdr (assoc .group .area #'string-equal)))
+                       (area (or (when (consp area) (cdr (assq 'sort_key area))) area .group)))
+                  (if (null entry)
+                      (push (list id (vector name area count streams)) gikopoi-room-list-data)
+                    (setf (aref (cadr entry) 2) count
+                          (aref (cadr entry) 3) streams)))))))
+      (error (message "Gikopoi: skipped room entry: %s" (error-message-string err))))))
 
 (gikopoi-defevent server-room-list (rooms)
   (gikopoi-update-room-list rooms)
-  ;; auto-move to busiest room on initial connect
+  ;; auto-move to globally busiest room on initial connect
   (when gikopoi--auto-move-on-join-p
     (setq gikopoi--auto-move-on-join-p nil)
-    (let ((best (gikopoi--busiest-room-in-group gikopoi--auto-move-area)))
-      (if (and best (not (equal best (gikopoi-room-id gikopoi-current-room))))
+    (let ((best (gikopoi--find-busiest-room))
+          (cur  (gikopoi-room-id gikopoi-current-room)))
+      (if (and best (not (equal best cur)))
           (progn
-            (message "Gikopoi: auto-joining %s" best)
+            (gikopoi-with-message-buffer
+              (insert (format "%s* auto-joining busiest room: %s\n"
+                              (format-time-string gikopoi-msg-time-format) best)))
             (gikopoi-change-room best))
-        (message "Gikopoi: already in busiest room (%s)"
-                 (gikopoi-room-id gikopoi-current-room)))))
+        (gikopoi-with-message-buffer
+          (insert (format "%s* already in busiest room: %s\n"
+                          (format-time-string gikopoi-msg-time-format) cur))))))
   ;; show room list only when user asked
   (when gikopoi--show-room-list-p
     (setq gikopoi--show-room-list-p nil)
@@ -1206,9 +1214,8 @@ Uses wss:// on port 443, ws:// otherwise."
          (room
           (let ((input (read-string (format "Room (default auto): "))))
             (if (string-empty-p input)
-                (progn (setq gikopoi--auto-move-on-join-p t
-                             gikopoi--auto-move-area area)
-                       (or gikopoi-default-room "silo"))
+                (progn (setq gikopoi--auto-move-on-join-p t)
+                       (or gikopoi-default-room "admin_area"))
               (progn (setq gikopoi--auto-move-on-join-p nil)
                      input))))
          (name
