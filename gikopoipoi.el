@@ -755,19 +755,35 @@ Each entry is (ROOM-ID [NAME AREA COUNT STREAMERS]).")
              gikopoi--room-user-counts)
     best-id))
 
+(defun gikopoi--overall-busiest-room-id ()
+  "Return the room ID with the most users, including the current room."
+  (let (best-id best-n)
+    (maphash (lambda (id n)
+               (when (or (null best-n) (> n best-n))
+                 (setq best-id id best-n n)))
+             gikopoi--room-user-counts)
+    best-id))
+
 (gikopoi-defevent server-room-list (rooms)
   (gikopoi-update-room-list rooms)
   (cond
    (gikopoi--join-busiest-p
     (setq gikopoi--join-busiest-p nil)
-    (if-let ((id (gikopoi--busiest-room-id)))
-        (progn
+    (let* ((cur     (and gikopoi-current-room (gikopoi-room-id gikopoi-current-room)))
+           (overall (gikopoi--overall-busiest-room-id)))
+      (if (equal cur overall)
           (gikopoi-with-message-buffer
-            (insert (format "%s* joining busiest room: %s (%d users)\n"
+            (insert (format "%s* already in the busiest room (%d users)\n"
                             (format-time-string gikopoi-msg-time-format)
-                            id (gethash id gikopoi--room-user-counts 0))))
-          (gikopoi-change-room id))
-      (message "Gikopoi: no other rooms with users found")))
+                            (gethash cur gikopoi--room-user-counts 0))))
+        (if-let ((id (gikopoi--busiest-room-id)))
+            (progn
+              (gikopoi-with-message-buffer
+                (insert (format "%s* joining busiest room: %s (%d users)\n"
+                                (format-time-string gikopoi-msg-time-format)
+                                id (gethash id gikopoi--room-user-counts 0))))
+              (gikopoi-change-room id))
+          (message "Gikopoi: no other rooms with users found")))))
    (t
     (setq gikopoi--show-room-list-p nil)
     (gikopoi--refresh-room-list-buffer))))
