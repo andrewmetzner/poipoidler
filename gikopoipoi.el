@@ -606,7 +606,7 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
       (dolist (u (gikopoi-room-users gikopoi-current-room))
         (unless (gikopoi-user-ignored-p u)
           (when-let ((msg (gikopoi-user-last-message u)))
-            (gikopoi-user-msg u msg t))))))
+            (gikopoi-user-msg u msg t)))))))
 
 (gikopoi-defevent server-update-current-room-streams (streams)
   (setf (gikopoi-room-streams gikopoi-current-room) streams))
