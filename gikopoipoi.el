@@ -1079,7 +1079,7 @@ Called with a string (e.g. via #rula) warps directly to that room ID."
               (mapcar (lambda (e)
                         (format "%s [%s]" (car e) (aref (cadr e) 2)))
                       gikopoi-room-list-data))
-             (choice (completing-read "Room: " candidates nil nil)))
+             (choice (completing-read "rula: " candidates nil nil)))
         (replace-regexp-in-string " \\[.*\\]$" "" choice)))))
   (when (and room-id (not (string-empty-p room-id)))
     (gikopoi-change-room room-id)))
