@@ -331,7 +331,7 @@
 (defun gikopoi-change-room (room-id &optional door-id)
   (gikopoi-socket-emit "user-change-room"
                        `((targetRoomId . ,room-id)
-                         (targetDoorId . ,(or door-id :json-null)))))
+                         ,@(when door-id `((targetDoorId . ,door-id))))))
 
 (defun gikopoi-room-list-request ()
   "Ask the server for the room list (triggers `server-room-list')."
@@ -583,20 +583,30 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
 ;;; Room events
 
 (gikopoi-defevent server-update-current-room-state ((currentRoom connectedUsers streams))
-  (setq gikopoi-current-room-loading-p t
-        gikopoi-current-room
-        (gikopoi--get-or-create-room
-         (alist-get 'id    currentRoom)
-         (alist-get 'group currentRoom)
-         currentRoom
-         connectedUsers))
-  (when (fboundp 'gikopoi-load-auto-ignored-users)
-    (gikopoi-load-auto-ignored-users))
-  (unless gikopoi-reconnecting-p
-    (dolist (u (gikopoi-room-users gikopoi-current-room))
-      (unless (gikopoi-user-ignored-p u)
-        (when-let ((msg (gikopoi-user-last-message u)))
-          (gikopoi-user-msg u msg t))))))
+  (let ((prev-id (and gikopoi-current-room
+                      (gikopoi-room-id gikopoi-current-room)))
+        (new-id  (alist-get 'id currentRoom)))
+    (setq gikopoi-current-room-loading-p t
+          gikopoi-current-room
+          (gikopoi--get-or-create-room
+           new-id
+           (alist-get 'group currentRoom)
+           currentRoom
+           connectedUsers))
+    (when (fboundp 'gikopoi-load-auto-ignored-users)
+      (gikopoi-load-auto-ignored-users))
+    (when (and prev-id (not (equal prev-id new-id)))
+      (gikopoi-with-message-buffer
+        (insert (format "%s* now in room: %s\n"
+                        (format-time-string gikopoi-msg-time-format)
+                        new-id)))
+      (force-mode-line-update t)
+      (gikopoi--refresh-user-list-buffer))
+    (unless gikopoi-reconnecting-p
+      (dolist (u (gikopoi-room-users gikopoi-current-room))
+        (unless (gikopoi-user-ignored-p u)
+          (when-let ((msg (gikopoi-user-last-message u)))
+            (gikopoi-user-msg u msg t))))))
 
 (gikopoi-defevent server-update-current-room-streams (streams)
   (setf (gikopoi-room-streams gikopoi-current-room) streams))
@@ -604,12 +614,14 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
 (gikopoi-defevent server-user-joined-room (user &optional from reconnectingp)
   (let ((u (gikopoi-make-user user)))
     (gikopoi-room-add-user gikopoi-current-room u)
-    (gikopoi-user-join u from reconnectingp)))
+    (gikopoi-user-join u from reconnectingp)
+    (gikopoi--refresh-user-list-buffer)))
 
 (gikopoi-defevent server-user-left-room (id &optional destination)
   (when-let ((u (gikopoi-user-by-id id)))
     (gikopoi-user-leave u destination)
-    (gikopoi-room-remove-user gikopoi-current-room u)))
+    (gikopoi-room-remove-user gikopoi-current-room u)
+    (gikopoi--refresh-user-list-buffer)))
 
 ;;; User events
 
@@ -640,7 +652,8 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
 
 (gikopoi-defevent server-msg (id message)
   (when-let ((u (gikopoi-user-by-id id)))
-    (gikopoi-user-msg u message)))
+    (gikopoi-user-msg u message)
+    (gikopoi--refresh-user-list-buffer)))
 
 (gikopoi-defevent server-roleplay (id message)
   (when-let ((u (gikopoi-user-by-id id)))
@@ -906,16 +919,22 @@ Requests a fresh room list from the server first."
   (mapcar (lambda (u)
             (list (gikopoi-user-id u)
                   (vector (gikopoi-user-name u)
-                          (concat (if (gikopoi-user-active-p  u) "" "Zz")
-                                  (if (gikopoi-user-ignored-p u) " I" ""))
-                          (format "%s" (gikopoi-user-id u)))))
+                          (concat (if (gikopoi-user-active-p  u) "" "z")
+                                  (if (gikopoi-user-ignored-p u) "I" ""))
+                          (or (gikopoi-user-last-message u) ""))))
           (gikopoi-room-users gikopoi-current-room)))
+
+(defun gikopoi--refresh-user-list-buffer ()
+  (when (buffer-live-p gikopoi-user-list-buffer)
+    (with-current-buffer gikopoi-user-list-buffer
+      (tabulated-list-revert))))
 
 (defun gikopoi-init-user-list-buffer ()
   (setq gikopoi-user-list-buffer (get-buffer-create "*Gikopoi Users*"))
   (with-current-buffer gikopoi-user-list-buffer
     (tabulated-list-mode)
-    (setq tabulated-list-format [("Name" 25 t) ("Status" 6 nil) ("ID" 10 t)])
+    (setq tabulated-list-format
+          [("Name" 20 t) ("St" 2 nil) ("Last Message" 0 nil)])
     (tabulated-list-init-header)
     (add-hook 'tabulated-list-revert-hook
               (lambda () (setq tabulated-list-entries (gikopoi--user-list-entries)))
@@ -969,7 +988,7 @@ Requests a fresh room list from the server first."
   (define-key m (kbd "SPC")       #'gikopoi-open-minibuffer)
   (define-key m (kbd "RET")       #'gikopoi-send-blank)
   (define-key m (kbd "r")         #'gikopoi-rula)
-  (define-key m (kbd "R")         #'gikopoi-list-rooms)
+  (define-key m (kbd "R")         #'gikopoi-list-users)
   (define-key m (kbd "B")         #'gikopoi-join-busiest-room)
   (define-key m (kbd "i")         #'gikopoi-ignore)
   (define-key m (kbd "x")         #'gikopoi-block)
@@ -1048,26 +1067,19 @@ Requests a fresh room list from the server first."
 
 (defun gikopoi-rula (&optional room-id)
   "Teleport to ROOM-ID, or prompt with the room list.
-When called with a string (e.g. via #rula), warp directly to that room ID.
-When called interactively, fetch the room list first if needed, then prompt."
+Called with a string (e.g. via #rula) warps directly to that room ID."
   (interactive
    (list
     (progn
       (when (null gikopoi-room-list-data)
         (gikopoi-room-list-request)
         (user-error "Fetching room list — press r again in a moment"))
-      (let* ((id->annotation
+      (let* ((candidates
               (mapcar (lambda (e)
-                        (cons (car e)
-                              (format "  %s  [%s users]"
-                                      (aref (cadr e) 0)
-                                      (aref (cadr e) 2))))
+                        (format "%s [%s]" (car e) (aref (cadr e) 2)))
                       gikopoi-room-list-data))
-             (ids (mapcar #'car id->annotation)))
-        (let ((completion-extra-properties
-               (list :annotation-function
-                     (lambda (id) (cdr (assoc id id->annotation))))))
-          (completing-read "Room: " ids nil t))))))
+             (choice (completing-read "Room: " candidates nil t)))
+        (replace-regexp-in-string " \\[.*\\]$" "" choice)))))
   (when room-id (gikopoi-change-room room-id)))
 
 (defun gikopoi-send-message ()
