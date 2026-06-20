@@ -1310,8 +1310,8 @@ Each receives (server port area room name character password).")
             (if (string-empty-p in) gikopoi-default-area in)))
          (room
           (let ((in (read-string
-                     (format "Room (default %s): " (or gikopoi-default-room "admin_bar")))))
-            (if (string-empty-p in) (or gikopoi-default-room "admin_bar") in)))
+                     (format "Room (default %s): " (or gikopoi-default-room "bar")))))
+            (if (string-empty-p in) (or gikopoi-default-room "bar") in)))
          (name
           (let* ((disp (if (and gikopoi-default-name
                                 (string-match "#" gikopoi-default-name))
