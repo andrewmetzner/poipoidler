@@ -131,8 +131,25 @@
   "Period in minutes for the optional periodic reconnect timer."
   :group 'gikopoi :type 'natnum)
 
+(defcustom gikopoi-auto-clear-bubble t
+  "If non-nil, automatically send a blank message to clear your speech bubble after chatting."
+  :group 'gikopoi :type 'boolean)
+
+(defcustom gikopoi-auto-clear-bubble-delay 8
+  "Seconds after sending a message before the speech bubble is auto-cleared."
+  :group 'gikopoi :type 'number)
+
 
 ;;; ── 3. Global State ───────────────────────────────────────────────────────
+
+(defvar gikopoi--anon-counter 0)
+(defvar gikopoi--anon-ids (make-hash-table :test #'equal)
+  "Maps user-id → assigned anonymous number for the current session.")
+
+(defun gikopoi--anon-number (id)
+  "Return a consistent per-session integer for anonymous user ID."
+  (or (gethash id gikopoi--anon-ids)
+      (puthash id (cl-incf gikopoi--anon-counter) gikopoi--anon-ids)))
 
 (defvar gikopoi-current-server  nil "Hostname of the active connection.")
 (defvar gikopoi-current-user-id nil "Public user ID assigned by the server.")
@@ -450,7 +467,9 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
 
 (cl-defmethod (setf gikopoi-user-name) (name (u gikopoi-user))
   (setf (slot-value u 'name)
-        (propertize (if (string-empty-p name) "Spy" name)
+        (propertize (if (string-empty-p name)
+                        (format "Anonymous#%d" (gikopoi--anon-number (slot-value u 'id)))
+                      name)
                     'face `(:foreground ,(slot-value u 'name-color)))))
 
 (defun gikopoi-make-user (alist)
@@ -1121,6 +1140,8 @@ Called with a string (e.g. via #rula) warps directly to that room ID."
       (gikopoi-list-users))
      (t
       (gikopoi-send msg)
+      (when gikopoi-auto-clear-bubble
+        (run-at-time gikopoi-auto-clear-bubble-delay nil #'gikopoi-send-blank))
       (when-let ((w (get-buffer-window "*Gikopoi*")))
         (select-window w))))))
 
@@ -1272,7 +1293,9 @@ There is no unblock in this session — reconnect to reset."
 (defun gikopoi-connect (server port area room name character password)
   "Establish an HTTP login and open the WebSocket to SERVER."
   (setq gikopoi--deliberately-quit nil
-        gikopoi-room-list-data     nil)
+        gikopoi-room-list-data     nil
+        gikopoi--anon-counter      0)
+  (clrhash gikopoi--anon-ids)
   (when (timerp gikopoi--reconnect-timer) (cancel-timer gikopoi--reconnect-timer))
   (when (and gikopoi-socket (websocket-openp gikopoi-socket))
     (gikopoi-socket-close))
