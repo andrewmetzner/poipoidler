@@ -1056,22 +1056,23 @@ When called interactively, fetch the room list first if needed, then prompt."
       (when (null gikopoi-room-list-data)
         (gikopoi-room-list-request)
         (user-error "Fetching room list — press r again in a moment"))
-      (let* ((name->id
-              (mapcar (lambda (e)
-                        (cons (aref (cadr e) 0) (car e)))
-                      gikopoi-room-list-data))
-             (name->count
-              (mapcar (lambda (e)
-                        (cons (aref (cadr e) 0) (aref (cadr e) 2)))
-                      gikopoi-room-list-data))
+      (let* ((entries gikopoi-room-list-data)
+             (names   (mapcar (lambda (e) (aref (cadr e) 0)) entries))
+             (counts  (mapcar (lambda (e) (aref (cadr e) 2)) entries))
              (choice
               (let ((completion-extra-properties
                      (list :annotation-function
                            (lambda (name)
-                             (when-let ((count (cdr (assoc name name->count))))
-                               (format "  [%s users]" count))))))
-                (completing-read "Room: " (mapcar #'car name->id) nil t))))
-        (cdr (assoc choice name->id))))))
+                             (let ((i (cl-position name names :test #'string=)))
+                               (when i (format "  [%s users]" (nth i counts))))))))
+                (completing-read "Room: " names nil nil)))
+             ;; resolve: try display-name match, then room-ID match, then raw input
+             (entry (or (cl-find choice entries
+                                 :key (lambda (e) (aref (cadr e) 0))
+                                 :test #'string=)
+                        (cl-find choice entries
+                                 :key #'car :test #'string=))))
+        (if entry (car entry) choice)))))
   (when room-id (gikopoi-change-room room-id)))
 
 (defun gikopoi-send-message ()
