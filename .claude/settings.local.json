@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(gh api *)",
+      "Bash(python3 -c \"import json,sys; d=json.load\\(sys.stdin\\); print\\(d.get\\('description',''\\), d.get\\('default_branch','main'\\)\\)\")",
+      "WebFetch(domain:gikopoipoi.net)",
+      "Bash(python3 -c ' *)",
+      "Bash(python3 -c \"import json,sys; items=json.load\\(sys.stdin\\); [print\\(i['name'], i['type']\\) for i in items]\")",
+      "Bash(python3 -c \"import json,sys; items=json.load\\(sys.stdin\\); [print\\(i['name']\\) for i in items]\")",
+      "Read(//tmp/**)",
+      "Bash(emacs *)",
+      "Bash(grep -v \"^$\")",
+      "WebFetch(domain:github.com)",
+      "Bash(gh search *)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" https://gikopoipoi.net/login)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" https://gikopoipoi.net/api/login)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" https://gikopoipoi.net/socket.io/)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" -X POST https://gikopoipoi.net/login)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" -X POST \"https://gikopoipoi.net/login?area=gikopoipoi\")",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" https://gikopoipoi.net/version)",
+      "Bash(curl -s https://gikopoipoi.net/api/version)",
+      "Bash(curl -s https://gikopoipoi.net/version)",
+      "Bash(curl -s \"https://gikopoipoi.net/api/areas/gikopoipoi/rooms/dorm\")",
+      "Bash(python3 -m json.tool)",
+      "Bash(curl -s \"https://gikopoipoi.net/api/areas/gikopoipoi/rooms/admin_area\")",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" \"https://gikopoipoi.net/api/rooms\")",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" \"https://gikopoipoi.net/api/areas\")",
+      "Bash(curl -s \"https://gikopoipoi.net/api/areas/gikopoipoi/rooms/bar\")",
+      "Bash(curl -s \"https://gikopoipoi.net/api/areas/gikopoipoi/rooms/lounge\")"
+    ]
+  }
+}
