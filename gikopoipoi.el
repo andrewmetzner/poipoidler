@@ -595,6 +595,8 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
            connectedUsers))
     (when (fboundp 'gikopoi-load-auto-ignored-users)
       (gikopoi-load-auto-ignored-users))
+    (when (null gikopoi-room-list-data)
+      (gikopoi-room-list-request))
     (when (and prev-id (not (equal prev-id new-id)))
       (gikopoi-with-message-buffer
         (insert (format "%s* now in room: %s\n"
@@ -1072,15 +1074,15 @@ Called with a string (e.g. via #rula) warps directly to that room ID."
    (list
     (progn
       (when (null gikopoi-room-list-data)
-        (gikopoi-room-list-request)
-        (user-error "Fetching room list — press r again in a moment"))
+        (gikopoi-room-list-request))
       (let* ((candidates
               (mapcar (lambda (e)
                         (format "%s [%s]" (car e) (aref (cadr e) 2)))
                       gikopoi-room-list-data))
-             (choice (completing-read "Room: " candidates nil t)))
+             (choice (completing-read "Room: " candidates nil nil)))
         (replace-regexp-in-string " \\[.*\\]$" "" choice)))))
-  (when room-id (gikopoi-change-room room-id)))
+  (when (and room-id (not (string-empty-p room-id)))
+    (gikopoi-change-room room-id)))
 
 (defun gikopoi-send-message ()
   "Prompt for a message.
