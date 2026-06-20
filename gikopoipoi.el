@@ -344,37 +344,39 @@
 
 (defun gikopoi--ws-message-handler (_sock frame)
   (condition-case err
-      (let (id payload)
-        (with-temp-buffer
-          (insert (websocket-frame-text frame))
-          (goto-char (point-min))
-          (setq id (thing-at-point 'number))
-          (forward-word)
-          (setq payload (ignore-errors (json-read))))
-        (pcase id
-          (0  ; EIO handshake
-           (let-alist payload
-             (setq gikopoi-socket-interval (/ .pingInterval 1000)
-                   gikopoi-socket-timeout  (/ .pingTimeout  1000))))
-          (2  ; ping – reset watchdog timer, send pong
-           (when (timerp gikopoi-socket-ping-timer)
-             (cancel-timer gikopoi-socket-ping-timer))
-           (websocket-send-text gikopoi-socket "3")
-           (setq gikopoi-socket-ping-timer
-                 (run-at-time (+ gikopoi-socket-interval gikopoi-socket-tolerance)
-                              nil
-                              (lambda ()
-                                (unless gikopoi--deliberately-quit
-                                  (gikopoi--schedule-reconnect 5))))))
-          (40 nil) ; socket.io connect ack
-          (42 (gikopoi--dispatch-event payload))
-          (_  (message "Gikopoi: unknown packet id=%s payload=%s" id payload))))
+      (let ((text (websocket-frame-text frame)))
+        (unless (stringp text) (signal 'gikopoi-skip nil)) ; binary frame – ignore
+        (let (id payload)
+          (with-temp-buffer
+            (insert text)
+            (goto-char (point-min))
+            (setq id (thing-at-point 'number))
+            (forward-word)
+            (setq payload (ignore-errors (json-read))))
+          (pcase id
+            (0  ; EIO handshake
+             (let-alist payload
+               (setq gikopoi-socket-interval (/ .pingInterval 1000)
+                     gikopoi-socket-timeout  (/ .pingTimeout  1000))))
+            (2  ; ping – reset watchdog timer, send pong
+             (when (timerp gikopoi-socket-ping-timer)
+               (cancel-timer gikopoi-socket-ping-timer))
+             (websocket-send-text gikopoi-socket "3")
+             (setq gikopoi-socket-ping-timer
+                   (run-at-time (+ gikopoi-socket-interval gikopoi-socket-tolerance)
+                                nil
+                                (lambda ()
+                                  (unless gikopoi--deliberately-quit
+                                    (gikopoi--schedule-reconnect 5))))))
+            (40 nil) ; socket.io connect ack
+            (42 (when (vectorp payload) (gikopoi--dispatch-event payload)))
+            (_  nil)))) ; unknown id – silently ignore
+    (gikopoi-skip nil) ; binary frame sentinel – no message
     (error
      (let ((msg (error-message-string err)))
        (unless (or (string-match-p "No usable sound device driver" msg)
                    (string-match-p "not connected" msg))
-         (message "Gikopoi: handler error [%s]: %s"
-                  (ignore-errors (aref payload 0)) msg))))))
+         (message "Gikopoi: handler error: %s" msg))))))
 
 
 ;;; ── 10. Server Event System ───────────────────────────────────────────────
@@ -407,11 +409,13 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
 
 (defun gikopoi--dispatch-event (payload)
   "Route PAYLOAD (a vector [\"eventName\" arg…]) to the matching handler."
-  (let* ((name (intern-soft (aref payload 0)))
+  (let* ((event-name (aref payload 0))
+         (name (and (stringp event-name) (intern-soft event-name)))
          (fn   (and name (get name 'gikopoi-event-handler))))
-    (if fn
-        (apply fn (cl-coerce (substring payload 1) 'list))
-      (message "Gikopoi: unhandled event %s" (aref payload 0)))))
+    (when (stringp event-name)
+      (if fn
+          (apply fn (cl-coerce (substring payload 1) 'list))
+        (message "Gikopoi: unhandled event %s" event-name)))))
 
 
 ;;; ── 11. Domain Classes ────────────────────────────────────────────────────
@@ -750,14 +754,9 @@ Each entry is (ROOM-ID [NAME AREA COUNT STREAMERS]).")
                             id (gethash id gikopoi--room-user-counts 0))))
           (gikopoi-change-room id))
       (message "Gikopoi: no other rooms with users found")))
-   (gikopoi--show-room-list-p
+   (t
     (setq gikopoi--show-room-list-p nil)
-    (when (buffer-live-p gikopoi-room-list-buffer)
-      (with-current-buffer gikopoi-room-list-buffer
-        (setq tabulated-list-entries gikopoi-room-list-data)
-        (tabulated-list-revert))
-      (unless (get-buffer-window gikopoi-room-list-buffer)
-        (display-buffer gikopoi-room-list-buffer))))))
+    (gikopoi--refresh-room-list-buffer))))
 
 (defun gikopoi-room-list-change-entry ()
   (interactive)
@@ -781,11 +780,23 @@ Each entry is (ROOM-ID [NAME AREA COUNT STREAMERS]).")
     (tabulated-list-init-header)
     (gikopoi-room-list-mode)))
 
+(defun gikopoi--refresh-room-list-buffer ()
+  "Update *Gikopoi Rooms* buffer contents in place."
+  (when (buffer-live-p gikopoi-room-list-buffer)
+    (with-current-buffer gikopoi-room-list-buffer
+      (setq tabulated-list-entries gikopoi-room-list-data)
+      (tabulated-list-print t))))
+
 (defun gikopoi-list-rooms ()
-  "Show the room list (opens/refreshes the *Gikopoi Rooms* buffer)."
+  "Show the room list buffer and request a fresh update from the server.
+The list shows the number of users per room (N) and any live streamers.
+Full user names per room are not available from the server room-list API."
   (interactive)
   (unless (buffer-live-p gikopoi-room-list-buffer)
     (gikopoi-init-room-list-buffer))
+  ;; Show current data immediately, then refresh when the server responds
+  (gikopoi--refresh-room-list-buffer)
+  (pop-to-buffer gikopoi-room-list-buffer)
   (setq gikopoi--show-room-list-p t)
   (gikopoi-room-list-request))
 
@@ -957,6 +968,7 @@ Requests a fresh room list from the server first."
   (define-key m (kbd "R")         #'gikopoi-list-rooms)
   (define-key m (kbd "B")         #'gikopoi-join-busiest-room)
   (define-key m (kbd "i")         #'gikopoi-ignore)
+  (define-key m (kbd "x")         #'gikopoi-block)
   (define-key m (kbd "L")         #'gikopoi-list-users)
   (define-key m (kbd "c")         #'gikopoi-clear-mentions)
   (define-key m (kbd "Q")         #'gikopoi-quit)
@@ -1066,12 +1078,25 @@ Requests a fresh room list from the server first."
     (call-interactively #'gikopoi-send-message)))
 
 (defun gikopoi-ignore (name)
-  (interactive (list (completing-read "Toggle ignore: " (gikopoi-user-names))))
+  "Toggle client-side ignore for NAME.  Their messages are hidden locally only."
+  (interactive (list (completing-read "Ignore/unignore user: " (gikopoi-user-names))))
   (when-let ((u (gikopoi-user-by-name name)))
     (setf (gikopoi-user-ignored-p u) (not (gikopoi-user-ignored-p u)))
     (when (called-interactively-p 'interactive)
-      (message "%s %s" (gikopoi-user-name u)
+      (message "Gikopoi: %s %s (local only)"
+               (gikopoi-user-name u)
                (if (gikopoi-user-ignored-p u) "ignored" "un-ignored")))))
+
+(defun gikopoi-block (name)
+  "Block NAME server-side.  The server removes mutual visibility immediately.
+This is stronger than ignore: neither you nor the blocked user can see each other.
+There is no unblock in this session — reconnect to reset."
+  (interactive (list (completing-read "Block user: " (gikopoi-user-names))))
+  (when-let ((u (gikopoi-user-by-name name)))
+    (let ((uid (gikopoi-user-id u)))
+      (setf (gikopoi-user-ignored-p u) t)
+      (gikopoi-socket-emit "user-block" uid)
+      (message "Gikopoi: blocked %s (%s)" (gikopoi-user-name u) uid))))
 
 
 ;;; ── 19. Auto-ignore ───────────────────────────────────────────────────────
