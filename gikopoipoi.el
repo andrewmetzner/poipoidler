@@ -182,6 +182,9 @@
 (defvar gikopoi--auto-move-on-join-p nil
   "When non-nil, auto-move to the busiest room after the first room list arrives.")
 
+(defvar gikopoi--auto-move-area nil
+  "Area group to filter when auto-moving to the busiest room.")
+
 (defvar gikopoi-room-groups nil
   "Alist mapping room-id to area group-id, populated by `server-room-list'.")
 
@@ -192,7 +195,7 @@
       (let* ((id    (car entry))
              (count (string-to-number (aref (cadr entry) 2)))
              (grp   (cdr (assoc id gikopoi-room-groups))))
-        (when (and (equal grp group) (> count best-count))
+        (when (and (or (null group) (equal grp group)) (> count best-count))
           (setq best-id id best-count count))))
     best-id))
 
@@ -292,8 +295,10 @@ Uses wss:// on port 443, ws:// otherwise."
          (message "Gikopoi: websocket error: %s" msg))))))
 
 (defun gikopoi-socket-emit (object)
-  (websocket-send-text gikopoi-socket
-                       (concat "42" (encode-coding-string (json-encode object) 'utf-8))))
+  (if (and gikopoi-socket (websocket-openp gikopoi-socket))
+      (websocket-send-text gikopoi-socket
+                           (concat "42" (encode-coding-string (json-encode object) 'utf-8)))
+    (user-error "Gikopoi: not connected")))
 
 
 ;;; Server Events
@@ -353,7 +358,10 @@ Uses wss:// on port 443, ws:// otherwise."
 (defvar gikopoi-current-private-user-id nil)
 
 (defun gikopoi-connect (server port area room name character password)
-  (setq gikopoi--deliberately-quit nil)
+  (setq gikopoi--deliberately-quit nil
+        gikopoi-room-list-data nil
+        gikopoi-room-groups nil
+        gikopoi--auto-move-area area)
   (when (timerp gikopoi--reconnect-timer)
     (cancel-timer gikopoi--reconnect-timer))
   (when (and (boundp 'gikopoi-socket) (websocket-openp gikopoi-socket))
@@ -560,10 +568,13 @@ Uses wss:// on port 443, ws:// otherwise."
   ;; auto-move to busiest room on initial connect
   (when gikopoi--auto-move-on-join-p
     (setq gikopoi--auto-move-on-join-p nil)
-    (when-let* ((grp  (ignore-errors (slot-value gikopoi-current-room 'group)))
-                (best (gikopoi--busiest-room-in-group grp))
-                (_ (not (equal best (gikopoi-room-id gikopoi-current-room)))))
-      (gikopoi-change-room best)))
+    (let ((best (gikopoi--busiest-room-in-group gikopoi--auto-move-area)))
+      (if (and best (not (equal best (gikopoi-room-id gikopoi-current-room))))
+          (progn
+            (message "Gikopoi: auto-joining %s" best)
+            (gikopoi-change-room best))
+        (message "Gikopoi: already in busiest room (%s)"
+                 (gikopoi-room-id gikopoi-current-room)))))
   ;; show room list only when user asked
   (when gikopoi--show-room-list-p
     (setq gikopoi--show-room-list-p nil)
@@ -1195,7 +1206,8 @@ Uses wss:// on port 443, ws:// otherwise."
          (room
           (let ((input (read-string (format "Room (default auto): "))))
             (if (string-empty-p input)
-                (progn (setq gikopoi--auto-move-on-join-p t)
+                (progn (setq gikopoi--auto-move-on-join-p t
+                             gikopoi--auto-move-area area)
                        (or gikopoi-default-room "silo"))
               (progn (setq gikopoi--auto-move-on-join-p nil)
                      input))))
