@@ -1056,23 +1056,18 @@ When called interactively, fetch the room list first if needed, then prompt."
       (when (null gikopoi-room-list-data)
         (gikopoi-room-list-request)
         (user-error "Fetching room list — press r again in a moment"))
-      (let* ((entries gikopoi-room-list-data)
-             (names   (mapcar (lambda (e) (aref (cadr e) 0)) entries))
-             (counts  (mapcar (lambda (e) (aref (cadr e) 2)) entries))
-             (choice
-              (let ((completion-extra-properties
-                     (list :annotation-function
-                           (lambda (name)
-                             (let ((i (cl-position name names :test #'string=)))
-                               (when i (format "  [%s users]" (nth i counts))))))))
-                (completing-read "Room: " names nil nil)))
-             ;; resolve: try display-name match, then room-ID match, then raw input
-             (entry (or (cl-find choice entries
-                                 :key (lambda (e) (aref (cadr e) 0))
-                                 :test #'string=)
-                        (cl-find choice entries
-                                 :key #'car :test #'string=))))
-        (if entry (car entry) choice)))))
+      (let* ((id->annotation
+              (mapcar (lambda (e)
+                        (cons (car e)
+                              (format "  %s  [%s users]"
+                                      (aref (cadr e) 0)
+                                      (aref (cadr e) 2))))
+                      gikopoi-room-list-data))
+             (ids (mapcar #'car id->annotation)))
+        (let ((completion-extra-properties
+               (list :annotation-function
+                     (lambda (id) (cdr (assoc id id->annotation))))))
+          (completing-read "Room: " ids nil t))))))
   (when room-id (gikopoi-change-room room-id)))
 
 (defun gikopoi-send-message ()
