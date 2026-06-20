@@ -139,17 +139,19 @@
   "Seconds after sending a message before the speech bubble is auto-cleared."
   :group 'gikopoi :type 'number)
 
+(defcustom gikopoi-anon-numbers t
+  "If non-nil, append a number to anonymous users (e.g. Anonymous#2731).
+The number is derived from the last 3 hex digits of the user's session ID,
+matching the poipoi browser extension.  Toggle with \\[gikopoi-toggle-anon-numbers]."
+  :group 'gikopoi :type 'boolean)
+
 
 ;;; ── 3. Global State ───────────────────────────────────────────────────────
 
-(defvar gikopoi--anon-counter 0)
-(defvar gikopoi--anon-ids (make-hash-table :test #'equal)
-  "Maps user-id → assigned anonymous number for the current session.")
-
 (defun gikopoi--anon-number (id)
-  "Return a consistent per-session integer for anonymous user ID."
-  (or (gethash id gikopoi--anon-ids)
-      (puthash id (cl-incf gikopoi--anon-counter) gikopoi--anon-ids)))
+  "Derive a 0–4095 number from the last 3 hex chars of user ID.
+Matches the algorithm used by the poipoi browser extension."
+  (string-to-number (substring id -3) 16))
 
 (defvar gikopoi-current-server  nil "Hostname of the active connection.")
 (defvar gikopoi-current-user-id nil "Public user ID assigned by the server.")
@@ -468,9 +470,21 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
 (cl-defmethod (setf gikopoi-user-name) (name (u gikopoi-user))
   (setf (slot-value u 'name)
         (propertize (if (string-empty-p name)
-                        (format "Anonymous#%d" (gikopoi--anon-number (slot-value u 'id)))
+                        (if gikopoi-anon-numbers
+                            (format "Anonymous#%d"
+                                    (gikopoi--anon-number (slot-value u 'id)))
+                          "Anonymous")
                       name)
                     'face `(:foreground ,(slot-value u 'name-color)))))
+
+(defun gikopoi-toggle-anon-numbers ()
+  "Toggle anonymous user numbering and refresh all names in the current room."
+  (interactive)
+  (setq gikopoi-anon-numbers (not gikopoi-anon-numbers))
+  (when gikopoi-current-room
+    (dolist (u (gikopoi-room-users gikopoi-current-room))
+      (setf (gikopoi-user-name u) (slot-value u 'name))))
+  (message "Gikopoi: anon numbers %s" (if gikopoi-anon-numbers "on" "off")))
 
 (defun gikopoi-make-user (alist)
   "Construct a `gikopoi-user' from a server-supplied ALIST."
@@ -1293,9 +1307,7 @@ There is no unblock in this session — reconnect to reset."
 (defun gikopoi-connect (server port area room name character password)
   "Establish an HTTP login and open the WebSocket to SERVER."
   (setq gikopoi--deliberately-quit nil
-        gikopoi-room-list-data     nil
-        gikopoi--anon-counter      0)
-  (clrhash gikopoi--anon-ids)
+        gikopoi-room-list-data     nil)
   (when (timerp gikopoi--reconnect-timer) (cancel-timer gikopoi--reconnect-timer))
   (when (and gikopoi-socket (websocket-openp gikopoi-socket))
     (gikopoi-socket-close))
