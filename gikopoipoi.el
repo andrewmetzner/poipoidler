@@ -160,6 +160,9 @@ Matches the algorithm used by the poipoi browser extension."
 (defvar gikopoi-current-room    nil "The active `gikopoi-room' object.")
 (defvar gikopoi-current-room-loading-p nil "Non-nil while a room transition is in progress.")
 (defvar gikopoi-rooms           nil "All `gikopoi-room' objects seen this session.")
+(defvar gikopoi--server-user-count   0   "Last user count from server-stats.")
+(defvar gikopoi--server-stream-count 0   "Last stream count from server-stats.")
+(defvar gikopoi--stats-mode-line     ""  "Mode-line fragment updated by server-stats.")
 
 
 ;;; ── 4. Filesystem Defaults ────────────────────────────────────────────────
@@ -353,8 +356,29 @@ Matches the algorithm used by the poipoi browser extension."
                          ,@(when door-id `((targetDoorId . ,door-id))))))
 
 (defun gikopoi-room-list-request ()
-  "Ask the server for the room list (triggers `server-room-list')."
-  (gikopoi-socket-emit "user-room-list"))
+  "Fetch the room list via REST API (the old user-room-list WS event is no longer served)."
+  (let* ((server (or gikopoi-current-server "gikopoipoi.net"))
+         (area   (or (nth 2 gikopoi--last-args) gikopoi-default-area "for"))
+         (pid    gikopoi-current-private-user-id)
+         (url    (format "https://%s/api/areas/%s/rooms" server area))
+         (url-request-method "GET")
+         (url-request-extra-headers
+          (when pid `(("Authorization" . ,(format "Bearer %s" pid))))))
+    (url-retrieve url
+                  (lambda (status)
+                    (if (plist-get status :error)
+                        (message "Gikopoi: room list fetch failed: %s"
+                                 (plist-get status :error))
+                      (goto-char (point-min))
+                      (re-search-forward "\r?\n\r?\n" nil t)
+                      (condition-case err
+                          (gikopoi--on-room-list (json-parse-buffer
+                                                  :array-type  'list
+                                                  :object-type 'alist))
+                        (error
+                         (message "Gikopoi: room list parse error: %s"
+                                  (error-message-string err))))))
+                  nil :silent :inhibit-cookies)))
 
 (defun gikopoi-user-ping ()
   (gikopoi-socket-emit "user-ping"))
@@ -424,7 +448,8 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
                                `(,key (cdr (assq ',key ,(car entry)))))
                              (cdr entry)))
                    alist-args)
-              ,@body)))))
+              ,@(or body '(nil)))))))
+
 
 (defun gikopoi--dispatch-event (payload)
   "Route PAYLOAD (a vector [\"eventName\" arg…]) to the matching handler."
@@ -444,6 +469,7 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
 (defclass gikopoi-user ()
   ((id              :initarg :id              :accessor gikopoi-user-id)
    (name            :initarg :name            :accessor gikopoi-user-name)
+   (raw-name        :initform ""             :accessor gikopoi-user-raw-name)
    (character-id    :initarg :character-id    :accessor gikopoi-user-character-id)
    (alt-p           :initarg :alt-p           :accessor gikopoi-user-alt-p)
    (position        :initarg :position        :accessor gikopoi-user-position)
@@ -461,8 +487,9 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
   (let* ((h   (/ (mod (sxhash (slot-value u 'id)) 360.0) 360.0))
          (rgb (color-hsl-to-rgb h 0.6 0.7)))
     (setf (slot-value u 'name-color) (apply #'color-rgb-to-hex rgb)))
-  ;; Propertize name now that color is set
-  (setf (gikopoi-user-name u) (slot-value u 'name))
+  ;; Preserve the raw server-supplied name before propertizing
+  (setf (slot-value u 'raw-name) (or (slot-value u 'name) ""))
+  (setf (gikopoi-user-name u) (slot-value u 'raw-name))
   ;; Track ourselves
   (when (equal gikopoi-current-user-id (slot-value u 'id))
     (setq gikopoi-current-user u)))
@@ -483,7 +510,7 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
   (setq gikopoi-anon-numbers (not gikopoi-anon-numbers))
   (when gikopoi-current-room
     (dolist (u (gikopoi-room-users gikopoi-current-room))
-      (setf (gikopoi-user-name u) (slot-value u 'name))))
+      (setf (gikopoi-user-name u) (gikopoi-user-raw-name u))))
   (message "Gikopoi: anon numbers %s" (if gikopoi-anon-numbers "on" "off")))
 
 (defun gikopoi-make-user (alist)
@@ -508,7 +535,7 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
 
 (defun gikopoi-user-by-name (name)
   (cl-find name (gikopoi-room-users gikopoi-current-room)
-           :test #'equal :key #'gikopoi-user-name))
+           :test #'string= :key #'gikopoi-user-raw-name))
 
 (defun gikopoi-user-names ()
   (mapcar #'gikopoi-user-name (gikopoi-room-users gikopoi-current-room)))
@@ -529,7 +556,7 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
 
 (cl-defmethod gikopoi-room-add-user ((r gikopoi-room) (u gikopoi-user))
   (cl-pushnew u (slot-value r 'users) :test #'equal :key #'gikopoi-user-id)
-  (when (member (gikopoi-user-name u) gikopoi-auto-ignore-names)
+  (when (member (gikopoi-user-raw-name u) gikopoi-auto-ignore-names)
     (setf (gikopoi-user-ignored-p u) t)))
 
 (cl-defmethod gikopoi-room-remove-user ((r gikopoi-room) (u gikopoi-user))
@@ -644,7 +671,8 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
             (gikopoi-user-msg u msg t)))))))
 
 (gikopoi-defevent server-update-current-room-streams (streams)
-  (setf (gikopoi-room-streams gikopoi-current-room) streams))
+  (setf (gikopoi-room-streams gikopoi-current-room) streams)
+  (force-mode-line-update))
 
 (gikopoi-defevent server-user-joined-room (user &optional from reconnectingp)
   (let ((u (gikopoi-make-user user)))
@@ -701,7 +729,13 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
 ;;; Server info events
 
 (gikopoi-defevent server-stats ((userCount streamCount))
-  (message "Gikopoi: %s users, %s streams" userCount streamCount))
+  (let ((n (if (stringp userCount)   (string-to-number userCount)   (or userCount 0)))
+        (s (if (stringp streamCount) (string-to-number streamCount) (or streamCount 0))))
+    (setq gikopoi--server-user-count   n
+          gikopoi--server-stream-count s
+          gikopoi--stats-mode-line
+          (format " [%su%s]" n (if (> s 0) (format " %ss" s) "")))
+    (force-mode-line-update)))
 
 (gikopoi-defevent server-system-message (_code message)
   (gikopoi-with-message-buffer
@@ -797,7 +831,8 @@ Each entry is (ROOM-ID [NAME AREA COUNT STREAMERS]).")
              gikopoi--room-user-counts)
     best-id))
 
-(gikopoi-defevent server-room-list (rooms)
+(defun gikopoi--on-room-list (rooms)
+  "Process ROOMS list (from HTTP or WS) and update display / busiest-join logic."
   (gikopoi-update-room-list rooms)
   (cond
    (gikopoi--join-busiest-p
@@ -820,6 +855,9 @@ Each entry is (ROOM-ID [NAME AREA COUNT STREAMERS]).")
    (t
     (setq gikopoi--show-room-list-p nil)
     (gikopoi--refresh-room-list-buffer))))
+
+(gikopoi-defevent server-room-list (rooms)
+  (gikopoi--on-room-list rooms))
 
 (defun gikopoi-room-list-change-entry ()
   (interactive)
@@ -887,7 +925,7 @@ Requests a fresh room list from the server first."
 
 (defun gikopoi--near-bottom-p ()
   (when-let ((w (get-buffer-window gikopoi-message-buffer)))
-    (<= (- (count-lines (window-end w t) (point-max)))
+    (<= (count-lines (window-end w t) (point-max))
         (window-body-height w))))
 
 (defmacro gikopoi-with-message-buffer (&rest body)
@@ -939,7 +977,7 @@ Requests a fresh room list from the server first."
   (when-let ((w (get-buffer-window gikopoi-message-buffer)))
     (with-selected-window w
       (scroll-up-command)
-      (when (<= (- (point-max) (window-end w t)) (window-body-height w))
+      (when (<= (count-lines (window-end w t) (point-max)) (window-body-height w))
         (goto-char (point-max)) (recenter -1)))))
 
 (defun gikopoi-scroll-up () (interactive)
@@ -1015,15 +1053,19 @@ Requests a fresh room list from the server first."
 (defun gikopoi-notif-string ()
   (if (cl-plusp gikopoi-unread-count)
       (cl-labels ((unique-prefix (i s)
-                    (let* ((p   (substring s 0 i))
-                           (cmp (try-completion p gikopoi-notif-names)))
-                      (cond ((member cmp gikopoi-notif-names) p)
-                            ((equal p cmp)                   (unique-prefix (1+ i) s))
-                            ((< (length p) (length cmp))     (unique-prefix (length cmp) s))))))
+                    (if (>= i (length s))
+                        s
+                      (let* ((p   (substring s 0 i))
+                             (cmp (try-completion p gikopoi-notif-names)))
+                        (cond ((member cmp gikopoi-notif-names) p)
+                              ((equal p cmp)                   (unique-prefix (1+ i) s))
+                              ((< (length p) (length cmp))     (unique-prefix (length cmp) s))
+                              (t                               s))))))
         (format " (%d)%s"
                 gikopoi-unread-count
                 (if gikopoi-notif-names
-                    (format ",%s" (mapcar (lambda (x) (unique-prefix 1 x)) gikopoi-notif-names))
+                    (concat "," (mapconcat (lambda (x) (unique-prefix 1 x))
+                                          gikopoi-notif-names ","))
                   "")))
     ""))
 
@@ -1070,10 +1112,11 @@ Requests a fresh room list from the server first."
 
 (add-to-list 'minor-mode-alist
              '(gikopoi-msg-mode
-               (:eval (format ": %s@%s"
+               (:eval (format ": %s@%s%s"
                               (and gikopoi-current-room
                                    (gikopoi-room-id gikopoi-current-room))
-                              gikopoi-current-server))))
+                              gikopoi-current-server
+                              gikopoi--stats-mode-line))))
 
 (add-to-list 'minor-mode-alist
              '(gikopoi-notif-mode (:eval (gikopoi-notif-string))))
@@ -1228,15 +1271,16 @@ There is no unblock in this session — reconnect to reset."
   (setq gikopoi-auto-ignore-names (gikopoi--load-auto-ignore))
   (when gikopoi-current-room
     (dolist (u (gikopoi-room-users gikopoi-current-room))
-      (when (member (gikopoi-user-name u) gikopoi-auto-ignore-names)
+      (when (member (gikopoi-user-raw-name u) gikopoi-auto-ignore-names)
         (setf (gikopoi-user-ignored-p u) t))))
   (message "Loaded %d auto-ignored users" (length gikopoi-auto-ignore-names)))
 
 (defun gikopoi-init-auto-ignore (&rest _)
   "Defer auto-ignore loading until the room is ready."
-  (if (and gikopoi-current-room (gikopoi-room-users gikopoi-current-room))
-      (gikopoi-load-auto-ignored-users)
-    (run-at-time 0.5 nil #'gikopoi-init-auto-ignore)))
+  (cond ((and gikopoi-current-room (gikopoi-room-users gikopoi-current-room))
+         (gikopoi-load-auto-ignored-users))
+        ((and gikopoi-socket (websocket-openp gikopoi-socket))
+         (run-at-time 0.5 nil #'gikopoi-init-auto-ignore))))
 
 
 ;;; ── 20. Timestamps ────────────────────────────────────────────────────────
@@ -1247,20 +1291,24 @@ There is no unblock in this session — reconnect to reset."
   (gikopoi-with-message-buffer
     (insert (format-time-string gikopoi-time-format))))
 
+(defun gikopoi--cancel-timestamp-timer ()
+  (when (timerp gikopoi-timestamp-timer)
+    (cancel-timer gikopoi-timestamp-timer)
+    (setq gikopoi-timestamp-timer nil)))
+
 (defun gikopoi-start-timestamps (&rest _)
   (unless (null gikopoi-timestamp-interval)
     (setq gikopoi-timestamp-timer
           (run-at-time t gikopoi-timestamp-interval #'gikopoi-print-timestamp))
-    (add-hook 'gikopoi-quit-functions
-              (lambda () (when (timerp gikopoi-timestamp-timer)
-                           (cancel-timer gikopoi-timestamp-timer))))))
+    (cl-pushnew #'gikopoi--cancel-timestamp-timer gikopoi-quit-functions)))
 
 
 ;;; ── 21. Connection Management ─────────────────────────────────────────────
 
 (defvar gikopoi-quit-functions
   (list #'gikopoi-socket-close
-        (lambda () (gikopoi-notif-mode -1)))
+        (lambda () (gikopoi-notif-mode -1))
+        (lambda () (setq gikopoi--stats-mode-line "") (force-mode-line-update)))
   "Hook run when disconnecting.  Each function is called with no arguments.")
 
 (defun gikopoi-quit ()
@@ -1338,7 +1386,8 @@ There is no unblock in this session — reconnect to reset."
         #'gikopoi-init-auto-ignore
         #'gikopoi-print-timestamp
         #'gikopoi-start-timestamps
-        #'gikopoi-maybe-start-reconnect-timer)
+        #'gikopoi-maybe-start-reconnect-timer
+        (lambda (&rest _) (gikopoi-notif-mode 1)))
   "Functions called in sequence when connecting.
 Each receives (server port area room name character password).")
 
@@ -1390,6 +1439,128 @@ Interactively prompts for all parameters (defaults from defcustom)."
   (run-hooks 'gikopoi-quit-functions)
   (run-hook-with-args 'gikopoi-init-functions
                       server port area room name character password))
+
+;;; ── 23. Debug / Diagnostics ───────────────────────────────────────────────
+
+(defvar gikopoi--debug-room-list-sent-at nil
+  "Timestamp of the most recent `user-room-list' request.")
+
+(defun gikopoi-debug-ping ()
+  "Test HTTP round-trip latency to the current server's /api/version endpoint.
+Reports elapsed time in milliseconds in the echo area and *Messages*."
+  (interactive)
+  (let ((server (or gikopoi-current-server
+                    (read-string "Server: " gikopoi-default-server))))
+    (message "Gikopoi-debug: pinging %s …" server)
+    (let* ((t0  (current-time))
+           (_   (with-temp-buffer
+                  (condition-case err
+                      (url-insert-file-contents (format "https://%s/api/version" server))
+                    (error (message "Gikopoi-debug: ping error: %s" (error-message-string err))))))
+           (ms  (round (* 1000 (float-time (time-subtract (current-time) t0))))))
+      (message "Gikopoi-debug: /api/version round-trip = %d ms" ms))))
+
+(defun gikopoi-debug-room-list-timing ()
+  "Send a user-room-list request and report how long the server takes to respond.
+One-shot: the next server-room-list reply is timed and reported."
+  (interactive)
+  (setq gikopoi--debug-room-list-sent-at (current-time))
+  (let ((orig (get 'server-room-list 'gikopoi-event-handler)))
+    (put 'server-room-list 'gikopoi-event-handler
+         (lambda (&rest args)
+           (let ((ms (round (* 1000 (float-time
+                                     (time-subtract (current-time)
+                                                    gikopoi--debug-room-list-sent-at))))))
+             (message "Gikopoi-debug: server-room-list arrived in %d ms" ms))
+           (put 'server-room-list 'gikopoi-event-handler orig) ; restore
+           (apply orig args))))
+  (message "Gikopoi-debug: sent user-room-list, waiting for reply…")
+  (gikopoi-room-list-request))
+
+(defun gikopoi-debug-status ()
+  "Print a short summary of current connection state to *Messages*."
+  (interactive)
+  (message
+   "Gikopoi-debug: server=%s  room=%s  socket=%s  room-list-data=%s  room-list-data-count=%d"
+   (or gikopoi-current-server "nil")
+   (and gikopoi-current-room (gikopoi-room-id gikopoi-current-room))
+   (cond ((null gikopoi-socket) "nil")
+         ((websocket-openp gikopoi-socket) "open")
+         (t "closed"))
+   (if gikopoi-room-list-data "loaded" "nil")
+   (length gikopoi-room-list-data)))
+
+(defun gikopoi-debug-room-list ()
+  "Send user-room-list and dump the raw server response to *Gikopoi Room List Debug*."
+  (interactive)
+  (unless (and gikopoi-socket (websocket-openp gikopoi-socket))
+    (user-error "Gikopoi: not connected"))
+  (let ((buf (get-buffer-create "*Gikopoi Room List Debug*"))
+        (orig (get 'server-room-list 'gikopoi-event-handler)))
+    (with-current-buffer buf
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (insert (format "Room-list debug — %s\n" (format-time-string "%F %T")))
+        (insert (format "Cached entries before request: %d\n\n" (length gikopoi-room-list-data)))
+        (insert "Waiting for server-room-list response…\n")))
+    (pop-to-buffer buf)
+    (put 'server-room-list 'gikopoi-event-handler
+         (lambda (rooms)
+           (put 'server-room-list 'gikopoi-event-handler orig)
+           (with-current-buffer (get-buffer-create "*Gikopoi Room List Debug*")
+             (let ((inhibit-read-only t))
+               (goto-char (point-max))
+               ;; ── raw arrival ──────────────────────────────────────────────
+               (insert (format "\n=== server-room-list received ===\n"))
+               (insert (format "Type:  %s\n"
+                               (cond ((null rooms)   "nil")
+                                     ((vectorp rooms) "vector")
+                                     ((listp rooms)   "list")
+                                     (t (format "%S" (type-of rooms))))))
+               (insert (format "Count: %s\n"
+                               (cond ((null rooms)   0)
+                                     ((vectorp rooms) (length rooms))
+                                     ((listp rooms)   (length rooms))
+                                     (t "N/A"))))
+               ;; ── first entry ──────────────────────────────────────────────
+               (let ((first (cond ((and (vectorp rooms) (> (length rooms) 0)) (aref rooms 0))
+                                  ((consp rooms) (car rooms)))))
+                 (if first
+                     (progn
+                       (insert "\nFirst room entry (raw):\n")
+                       (insert (format "  type: %s\n"
+                                       (if (listp first) "alist" (format "%S" (type-of first)))))
+                       (when (listp first)
+                         (insert (format "  keys: %s\n"
+                                         (mapcar #'car first))))
+                       (insert (format "  data: %S\n" first)))
+                   (insert "\nNo room entries in payload.\n")))
+               ;; ── per-room parse trial ─────────────────────────────────────
+               (insert "\n=== Parse trial ===\n")
+               (let ((ok 0) (skipped 0) (errors nil))
+                 (when (or (vectorp rooms) (listp rooms))
+                   (seq-doseq (room rooms)
+                     (condition-case err
+                         (let-alist room
+                           (if .id
+                               (cl-incf ok)
+                             (cl-incf skipped)))
+                       (error
+                        (push (error-message-string err) errors)))))
+                 (insert (format "  ok:      %d\n" ok))
+                 (insert (format "  no .id:  %d\n" skipped))
+                 (insert (format "  errors:  %d\n" (length errors)))
+                 (dolist (e (cl-remove-duplicates errors :test #'string=))
+                   (insert (format "    - %s\n" e))))
+               ;; ── run real handler ─────────────────────────────────────────
+               (insert "\n=== Running normal handler ===\n")
+               (condition-case err
+                   (progn (apply orig (list rooms))
+                          (insert (format "Done. gikopoi-room-list-data now has %d entries.\n"
+                                          (length gikopoi-room-list-data))))
+                 (error (insert (format "Handler error: %s\n" (error-message-string err)))))))))
+    (gikopoi-room-list-request)))
+
 
 (provide 'gikopoipoi)
 ;;; gikopoipoi.el ends here
