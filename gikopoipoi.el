@@ -1198,7 +1198,10 @@ Called with a string (e.g. via #rula) warps directly to that room ID."
      (t
       (gikopoi-send msg)
       (when gikopoi-auto-clear-bubble
-        (run-at-time gikopoi-auto-clear-bubble-delay nil #'gikopoi-send-blank))
+        (if (or (null gikopoi-auto-clear-bubble-delay)
+                (<= gikopoi-auto-clear-bubble-delay 0))
+            (gikopoi-send-blank)
+          (run-at-time gikopoi-auto-clear-bubble-delay nil #'gikopoi-send-blank)))
       (when-let ((w (get-buffer-window "*Gikopoi*")))
         (select-window w))))))
 
@@ -1329,6 +1332,8 @@ There is no unblock in this session — reconnect to reset."
   "Reconnect using the same credentials as the last `gikopoi' call."
   (when gikopoi--last-args
     (message "Gikopoi: reconnecting…")
+    (when gikopoi-current-room
+      (setf (nth 3 gikopoi--last-args) (gikopoi-room-id gikopoi-current-room)))
     (ignore-errors (gikopoi-quit-silent))
     (apply #'gikopoi gikopoi--last-args)))
 
