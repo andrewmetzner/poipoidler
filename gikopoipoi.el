@@ -135,10 +135,6 @@
   "If non-nil, automatically send a blank message to clear your speech bubble after chatting."
   :group 'gikopoi :type 'boolean)
 
-(defcustom gikopoi-auto-clear-bubble-delay 8
-  "Seconds after sending a message before the speech bubble is auto-cleared."
-  :group 'gikopoi :type 'number)
-
 (defcustom gikopoi-anon-numbers t
   "If non-nil, append a number to anonymous users (e.g. Anonymous#2731).
 The number is derived from the last 3 hex digits of the user's session ID,
@@ -1208,10 +1204,7 @@ Called with a string (e.g. via #rula) warps directly to that room ID."
      (t
       (gikopoi-send msg)
       (when gikopoi-auto-clear-bubble
-        (if (or (null gikopoi-auto-clear-bubble-delay)
-                (<= gikopoi-auto-clear-bubble-delay 0))
-            (gikopoi-send-blank)
-          (run-at-time gikopoi-auto-clear-bubble-delay nil #'gikopoi-send-blank)))
+        (gikopoi-send-blank))
       (when-let ((w (get-buffer-window "*Gikopoi*")))
         (select-window w))))))
 
