@@ -253,9 +253,19 @@ Matches the algorithm used by the poipoi browser extension."
                          ,@(when (and password (not (string-empty-p password)))
                              `((password . ,password)))))
           'utf-8)))
-    (with-temp-buffer
-      (url-insert-file-contents (format "https://%s/api/login" server))
-      (json-read-object))))
+    (let ((buf (url-retrieve-synchronously
+                (format "https://%s/api/login" server) :silent t)))
+      (unless buf (error "Gikopoi: login request failed (no response)"))
+      (unwind-protect
+          (with-current-buffer buf
+            (goto-char (point-min))
+            (re-search-forward "\r?\n\r?\n" nil t)
+            (condition-case err
+                (json-read-object)
+              (error
+               (error "Gikopoi: login response parse error: %s"
+                      (error-message-string err)))))
+        (kill-buffer buf)))))
 
 
 ;;; ── 9. WebSocket / Socket.IO Protocol ────────────────────────────────────
