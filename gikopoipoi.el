@@ -91,6 +91,10 @@
   "Face colour for messages that match `gikopoi-mention-regexp'."
   :group 'gikopoi :type '(choice (const nil) string))
 
+(defcustom gikopoi-occupied-room-color "green"
+  "Face colour for occupied rooms in the `gikopoi-rula' completion list."
+  :group 'gikopoi :type '(choice (const nil) string))
+
 (defcustom gikopoi-notif-position '(mode-line-modes . nil)
   "Where to insert the unread-count notifier in the mode line."
   :group 'gikopoi :type '(cons variable boolean))
@@ -105,14 +109,6 @@
 
 (defcustom gikopoi-msg-time-format "[%H:%M:%S] "
   "Short timestamp prepended to each message."
-  :group 'gikopoi :type 'string)
-
-(defcustom gikopoi-logger nil
-  "If non-nil, append chat to a daily log file."
-  :group 'gikopoi :type 'boolean)
-
-(defcustom gikopoi-log-directory (expand-file-name "~/.gikopoi-logs/")
-  "Directory for daily chat logs."
   :group 'gikopoi :type 'string)
 
 (defcustom gikopoi-auto-reconnect t
@@ -207,18 +203,6 @@ Matches the algorithm used by the poipoi browser extension."
       (with-temp-buffer
         (insert-file-contents file)
         (setq gikopoi-lang-alist (read (current-buffer)))))))
-
-
-;;; ── 7. Logging ────────────────────────────────────────────────────────────
-
-(defun gikopoi--log-to-file (text)
-  (when gikopoi-logger
-    (let* ((dir  gikopoi-log-directory)
-           (file (expand-file-name (concat (format-time-string "%Y-%m-%d") ".txt") dir)))
-      (unless (file-exists-p dir) (make-directory dir t))
-      (with-temp-buffer
-        (insert (or text ""))
-        (append-to-file (point-min) (point-max) file)))))
 
 
 ;;; ── 8. HTTP API ───────────────────────────────────────────────────────────
@@ -588,7 +572,6 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
 (cl-defmethod gikopoi-user-insert-message ((u gikopoi-user) text)
   (unless (gikopoi-user-ignored-p u)
     (let ((line (concat (format-time-string gikopoi-msg-time-format) (or text ""))))
-      (gikopoi--log-to-file line)
       (if (eq u gikopoi-current-user)
           (gikopoi-clear-mentions)
         (when (setq gikopoi-message-matched-p
@@ -1175,7 +1158,13 @@ Called with a string (e.g. via #rula) warps directly to that room ID."
         (gikopoi-room-list-request))
       (let* ((candidates
               (mapcar (lambda (e)
-                        (format "%s [%s]" (car e) (aref (cadr e) 2)))
+                        (let* ((count (aref (cadr e) 2))
+                               (label (format "%s [%s]" (car e) count)))
+                          (if (and gikopoi-occupied-room-color
+                                   (not (string= count "0")))
+                              (propertize label 'face
+                                          `(:foreground ,gikopoi-occupied-room-color))
+                            label)))
                       gikopoi-room-list-data))
              (choice (completing-read "rula: " candidates nil nil)))
         (replace-regexp-in-string " \\[.*\\]$" "" choice)))))
