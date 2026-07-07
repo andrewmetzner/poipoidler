@@ -1132,9 +1132,15 @@ Requests a fresh room list from the server first."
     m))
 
 (defun gikopoi-minibuffer-complete ()
+  "Complete the whitespace-delimited token at point against room user names.
+Uses whitespace boundaries rather than `thing-at-point' word bounds so that
+Japanese (and other non-space-delimited) names complete correctly — Emacs
+would otherwise split such names at kanji/kana/script boundaries and only
+match the trailing run."
   (interactive)
-  (let ((bounds (bounds-of-thing-at-point 'word)))
-    (completion-in-region (car bounds) (cdr bounds) (gikopoi-user-names))))
+  (let ((beg (save-excursion (skip-chars-backward "^ \t\n") (point)))
+        (end (save-excursion (skip-chars-forward  "^ \t\n") (point))))
+    (completion-in-region beg end (gikopoi-user-names))))
 
 (defun gikopoi-autoquote ()
   "Pre-fill the message prompt with a quote of the text at point."
