@@ -535,7 +535,7 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
 (defclass gikopoi-room ()
   ((id      :initarg :id      :accessor gikopoi-room-id)
    (group   :initarg :group)
-   (assets  :initarg :assets)
+   (assets  :initarg :assets  :accessor gikopoi-room-assets)
    (users   :initarg :users   :accessor gikopoi-room-users)
    (streams :initarg :streams :accessor gikopoi-room-streams))
   "A Gikopoi room, as reported by `server-update-current-room-state'.")
@@ -657,7 +657,8 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
       (dolist (u (gikopoi-room-users gikopoi-current-room))
         (unless (gikopoi-user-ignored-p u)
           (when-let ((msg (gikopoi-user-last-message u)))
-            (gikopoi-user-msg u msg t)))))))
+            (gikopoi-user-msg u msg t)))))
+    (gikopoi--refresh-map-buffer)))
 
 (gikopoi-defevent server-update-current-room-streams (streams)
   (setf (gikopoi-room-streams gikopoi-current-room) streams)
@@ -667,13 +668,15 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
   (let ((u (gikopoi-make-user user)))
     (gikopoi-room-add-user gikopoi-current-room u)
     (gikopoi-user-join u from reconnectingp)
-    (gikopoi--refresh-user-list-buffer)))
+    (gikopoi--refresh-user-list-buffer)
+    (gikopoi--refresh-map-buffer)))
 
 (gikopoi-defevent server-user-left-room (id &optional destination)
   (when-let ((u (gikopoi-user-by-id id)))
     (gikopoi-user-leave u destination)
     (gikopoi-room-remove-user gikopoi-current-room u)
-    (gikopoi--refresh-user-list-buffer)))
+    (gikopoi--refresh-user-list-buffer)
+    (gikopoi--refresh-map-buffer)))
 
 ;;; User events
 
@@ -689,7 +692,8 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
   (when-let ((u (gikopoi-user-by-id userId)))
     (setf (gikopoi-user-position      u) (cons x y)
           (gikopoi-user-direction     u) direction
-          (gikopoi-user-last-movement u) lastMovement)))
+          (gikopoi-user-last-movement u) lastMovement)
+    (gikopoi--refresh-map-buffer)))
 
 (gikopoi-defevent server-bubble-position (id direction)
   (when-let ((u (gikopoi-user-by-id id)))
@@ -1029,6 +1033,224 @@ Requests a fresh room list from the server first."
     (display-buffer gikopoi-user-list-buffer)))
 
 
+;;; ── 16b. Room Map Buffer ──────────────────────────────────────────────────
+;;;
+;;; A top-down grid of the current room: static tiles come from the room
+;;; `assets' (the raw `currentRoom' payload — size, blocked, sit, doors), and
+;;; avatars are drawn from the live user positions.  Gikopoi's coordinate
+;;; system puts the origin at the front-left with y increasing toward the back,
+;;; so rows are rendered highest-y first (back of the room at the top).
+
+(defvar gikopoi-map-buffer nil)
+
+(defcustom gikopoi-map-glyphs
+  '((floor . "·") (blocked . "▓") (sit . "▒") (door . "+"))
+  "Glyphs for the static tiles drawn in the room map."
+  :group 'gikopoi
+  :type '(alist :key-type symbol :value-type string))
+
+(defconst gikopoi--map-dir-arrows
+  '(("up" . "▲") ("down" . "▼") ("left" . "◀") ("right" . "▶"))
+  "Avatar glyph per facing direction; `gikopoi--map-arrow' falls back to a dot.")
+
+(defface gikopoi-map-floor   '((t :inherit shadow))
+  "Face for empty floor tiles in the room map." :group 'gikopoi)
+(defface gikopoi-map-blocked '((t :inherit shadow :weight bold))
+  "Face for blocked/wall tiles in the room map." :group 'gikopoi)
+(defface gikopoi-map-sit     '((t :inherit font-lock-comment-face))
+  "Face for sittable tiles in the room map." :group 'gikopoi)
+(defface gikopoi-map-door    '((t :inherit warning :weight bold))
+  "Face for door/exit tiles in the room map." :group 'gikopoi)
+(defface gikopoi-map-you     '((t :inherit highlight :weight bold))
+  "Face for your own avatar in the room map." :group 'gikopoi)
+
+(defcustom gikopoi-map-tile-colors
+  '((door . "#b58900") (sit . "#3a5f7a"))
+  "Background colours for special tiles, drawn as full-cell blocks.
+The block is painted under any avatar standing on the tile, so a door or
+warp stays visible when people are stacked on top of it.  Kinds without an
+entry (e.g. `floor', `blocked') get no colour block."
+  :group 'gikopoi
+  :type '(alist :key-type symbol :value-type color))
+
+(defun gikopoi--room-assets ()
+  (and gikopoi-current-room (gikopoi-room-assets gikopoi-current-room)))
+
+(defun gikopoi--map-glyph (kind) (alist-get kind gikopoi-map-glyphs))
+
+(defun gikopoi--map-arrow (dir)
+  (or (cdr (assoc dir gikopoi--map-dir-arrows)) "●"))
+
+(defun gikopoi--map-dimensions ()
+  "Return (WIDTH . HEIGHT) of the current room in tiles, or nil."
+  (when-let ((size (alist-get 'size (gikopoi--room-assets))))
+    (cons (alist-get 'x size) (alist-get 'y size))))
+
+(defun gikopoi--coords->set (vec)
+  "Turn VEC, a sequence of {x,y} coord alists, into an `equal' hash of (X . Y)."
+  (let ((h (make-hash-table :test 'equal)))
+    (mapc (lambda (c)
+            (puthash (cons (alist-get 'x c) (alist-get 'y c)) t h))
+          (append vec nil))
+    h))
+
+(defun gikopoi--map-door-set ()
+  "Hash (X . Y) → door id for every door in the current room."
+  (let ((h (make-hash-table :test 'equal)))
+    (dolist (d (alist-get 'doors (gikopoi--room-assets)) h)
+      (let ((c (cdr d)))
+        (puthash (cons (alist-get 'x c) (alist-get 'y c)) (car d) h)))))
+
+(defun gikopoi--map-user-set ()
+  "Hash (X . Y) → list of users standing on that tile."
+  (let ((h (make-hash-table :test 'equal)))
+    (dolist (u (gikopoi-room-users gikopoi-current-room) h)
+      (when-let ((pos (gikopoi-user-position u)))
+        (push u (gethash (cons (car pos) (cdr pos)) h))))))
+
+(defun gikopoi--map-user-glyph (users)
+  "Return the propertized avatar glyph for the USERS on a single tile."
+  (let* ((you   (memq gikopoi-current-user users))
+         (u     (if you gikopoi-current-user (car users)))
+         (names (mapconcat #'gikopoi-user-raw-name users ", ")))
+    (cond
+     (you (propertize (gikopoi--map-arrow (gikopoi-user-direction u))
+                      'face 'gikopoi-map-you
+                      'help-echo (if (cdr users)
+                                     (format "you (+%d here): %s" (1- (length users)) names)
+                                   "you")))
+     ((cdr users)                       ; more than one other user
+      (propertize (if (< (length users) 10) (number-to-string (length users)) "+")
+                  'face 'bold 'help-echo names))
+     (t (propertize (gikopoi--map-arrow (gikopoi-user-direction u))
+                    'face `(:foreground ,(gikopoi-user-name-color u))
+                    'help-echo names)))))
+
+(defun gikopoi--map-tile-glyph (kind door-id)
+  "Return the propertized static glyph for a tile of KIND (`door', `sit', …)."
+  (pcase kind
+    ('door    (propertize (gikopoi--map-glyph 'door) 'face 'gikopoi-map-door
+                          'help-echo (format "door: %s" door-id)))
+    ('sit     (propertize (gikopoi--map-glyph 'sit) 'face 'gikopoi-map-sit))
+    ('blocked (propertize (gikopoi--map-glyph 'blocked) 'face 'gikopoi-map-blocked))
+    (_        (propertize (gikopoi--map-glyph 'floor) 'face 'gikopoi-map-floor))))
+
+(defun gikopoi--map-cell (x y blocked sit doors users)
+  "Return the 2-column propertized string for tile (X . Y).
+Special tiles are painted as a full-cell colour block (see
+`gikopoi-map-tile-colors'); an avatar is layered on top so the block — e.g.
+a door or warp — stays visible even with people stacked on it."
+  (let* ((key  (cons x y))
+         (occ  (gethash key users))
+         (kind (cond ((gethash key doors)   'door)
+                     ((gethash key sit)     'sit)
+                     ((gethash key blocked) 'blocked)
+                     (t                     'floor)))
+         (bg   (cdr (assq kind gikopoi-map-tile-colors)))
+         (cell (concat (if occ
+                           (gikopoi--map-user-glyph occ)
+                         (gikopoi--map-tile-glyph kind (gethash key doors)))
+                       " ")))
+    (when bg
+      ;; Paint the colour block so it wins over any background the avatar face
+      ;; carries (e.g. `highlight' for you), while keeping the avatar's own
+      ;; foreground colour — so a door/warp stays visible under stacked people.
+      (add-face-text-property 0 (length cell) `(:background ,bg) nil cell))
+    cell))
+
+(defun gikopoi--map-swatch (glyph face kind)
+  "Return a legend GLYPH with FACE, plus KIND's colour block (as on the map)."
+  (let ((s (copy-sequence (propertize glyph 'face face)))
+        (bg (cdr (assq kind gikopoi-map-tile-colors))))
+    (when bg
+      (add-face-text-property 0 (length s) `(:background ,bg) nil s))
+    s))
+
+(defun gikopoi--map-legend ()
+  "Return the legend line describing the room-map glyphs."
+  (concat
+   "\n"
+   (gikopoi--map-swatch (gikopoi--map-arrow "up") 'gikopoi-map-you nil) " you   "
+   (gikopoi--map-swatch "●" 'font-lock-keyword-face nil)                " other   "
+   (gikopoi--map-swatch "2" 'bold nil)                                  " stacked   "
+   (gikopoi--map-swatch (gikopoi--map-glyph 'door) 'gikopoi-map-door 'door) " door   "
+   (gikopoi--map-swatch (gikopoi--map-glyph 'sit)  'gikopoi-map-sit  'sit)  " sit   "
+   (gikopoi--map-swatch (gikopoi--map-glyph 'blocked) 'gikopoi-map-blocked 'blocked)
+   " wall\n"))
+
+(defun gikopoi--render-map ()
+  "Insert the current room map at point."
+  (let ((dim (gikopoi--map-dimensions)))
+    (if (not dim)
+        (insert "No room map available.\n")
+      (let* ((w       (car dim))
+             (h       (cdr dim))
+             (blocked (gikopoi--coords->set (alist-get 'blocked (gikopoi--room-assets))))
+             (sit     (gikopoi--coords->set (alist-get 'sit     (gikopoi--room-assets))))
+             (doors   (gikopoi--map-door-set))
+             (users   (gikopoi--map-user-set)))
+        (insert (propertize (format "%s  (%d×%d)\n"
+                                     (gikopoi-room-id gikopoi-current-room) w h)
+                            'face 'bold))
+        (when-let ((p (and gikopoi-current-user
+                           (gikopoi-user-position gikopoi-current-user))))
+          (insert (format "you: (%s,%s) facing %s\n"
+                          (car p) (cdr p)
+                          (gikopoi-user-direction gikopoi-current-user))))
+        (insert "\n")
+        (cl-loop for y from (1- h) downto 0 do
+                 (cl-loop for x from 0 below w do
+                          (insert (gikopoi--map-cell x y blocked sit doors users)))
+                 (insert "\n"))
+        (insert (gikopoi--map-legend))))))
+
+(define-derived-mode gikopoi-map-mode special-mode "Gikopoi-Map"
+  "Major mode for the Gikopoi room map buffer."
+  :group 'gikopoi
+  (setq truncate-lines t))
+
+(define-key gikopoi-map-mode-map (kbd "g") #'gikopoi-show-map)
+
+(defun gikopoi--map-draw ()
+  "Render the room map into its buffer."
+  (when (buffer-live-p gikopoi-map-buffer)
+    (with-current-buffer gikopoi-map-buffer
+      (let ((inhibit-read-only t))
+        (erase-buffer)
+        (gikopoi--render-map)
+        (goto-char (point-min))))))
+
+(defun gikopoi--map-fit-windows ()
+  "Resize every window showing the map to fit the map, up to half the frame."
+  (dolist (w (get-buffer-window-list gikopoi-map-buffer nil t))
+    (with-selected-window w
+      (fit-window-to-buffer w (max 8 (/ (frame-height) 2))))))
+
+(defun gikopoi--refresh-map-buffer ()
+  "Redraw the room map (and refit its window) if it is currently displayed."
+  (when (and (buffer-live-p gikopoi-map-buffer)
+             (get-buffer-window gikopoi-map-buffer t))
+    (gikopoi--map-draw)
+    (gikopoi--map-fit-windows)))
+
+(defun gikopoi-show-map ()
+  "Display a top-down map of the current room and everyone's position in it.
+The map opens in a window docked below the current one, sized to fit the map."
+  (interactive)
+  (unless gikopoi-current-room
+    (user-error "Gikopoi: not in a room"))
+  (unless (buffer-live-p gikopoi-map-buffer)
+    (setq gikopoi-map-buffer (get-buffer-create "*Gikopoi Map*"))
+    (with-current-buffer gikopoi-map-buffer (gikopoi-map-mode)))
+  (gikopoi--map-draw)                    ; draw first so the window can fit it
+  (display-buffer
+   gikopoi-map-buffer
+   '((display-buffer-reuse-window display-buffer-below-selected)
+     (window-height . fit-window-to-buffer)
+     (preserve-size . (nil . t))))
+  (gikopoi--map-fit-windows))
+
+
 ;;; ── 17. Modes & Keybindings ───────────────────────────────────────────────
 
 (defvar gikopoi-unread-count 0)
@@ -1071,6 +1293,7 @@ Requests a fresh room list from the server first."
   (define-key m (kbd "RET")       #'gikopoi-send-blank)
   (define-key m (kbd "r")         #'gikopoi-rula)
   (define-key m (kbd "R")         #'gikopoi-list-users)
+  (define-key m (kbd "m")         #'gikopoi-show-map)
   (define-key m (kbd "B")         #'gikopoi-join-busiest-room)
   (define-key m (kbd "i")         #'gikopoi-ignore)
   (define-key m (kbd "x")         #'gikopoi-block)
