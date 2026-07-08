@@ -127,23 +127,24 @@
   "Period in minutes for the optional periodic reconnect timer."
   :group 'gikopoi :type 'natnum)
 
-(defcustom gikopoi-auto-clear-bubble t
+(defcustom gikopoi-auto-clear-bubble nil
   "If non-nil, automatically send a blank message to clear your speech bubble after chatting."
   :group 'gikopoi :type 'boolean)
 
 (defcustom gikopoi-anon-numbers t
-  "If non-nil, append a number to anonymous users (e.g. Anonymous#2731).
-The number is derived from the last 3 hex digits of the user's session ID,
-matching the poipoi browser extension.  Toggle with \\[gikopoi-toggle-anon-numbers]."
+  "If non-nil, label anonymous (unnamed) users as \"Anonymous#N\".
+The number is derived from the user id (see `gikopoi--anon-number');
+toggle at runtime with `gikopoi-toggle-anon-numbers'."
   :group 'gikopoi :type 'boolean)
-
 
 ;;; ── 3. Global State ───────────────────────────────────────────────────────
 
 (defun gikopoi--anon-number (id)
   "Derive a 0–4095 number from the last 3 hex chars of user ID.
 Matches the algorithm used by the poipoi browser extension."
-  (string-to-number (substring id -3) 16))
+  (if (and (stringp id) (>= (length id) 3))
+      (string-to-number (substring id -3) 16)
+    0))
 
 (defvar gikopoi-current-server  nil "Hostname of the active connection.")
 (defvar gikopoi-current-user-id nil "Public user ID assigned by the server.")
@@ -658,6 +659,13 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
         (unless (gikopoi-user-ignored-p u)
           (when-let ((msg (gikopoi-user-last-message u)))
             (gikopoi-user-msg u msg t)))))
+    (gikopoi--map-anim-reset)
+    ;; Auto-open the map on first connect (deferred so the room settles first).
+    (when (and gikopoi-map-auto-open (null prev-id)
+               (not gikopoi-reconnecting-p)
+               (not (buffer-live-p gikopoi-map-buffer)))
+      (run-at-time 0.5 nil (lambda ()
+                             (when gikopoi-current-room (gikopoi-show-map)))))
     (gikopoi--refresh-map-buffer)))
 
 (gikopoi-defevent server-update-current-room-streams (streams)
@@ -690,14 +698,20 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
 
 (gikopoi-defevent server-move ((userId x y direction lastMovement isInstant shouldSpinwalk))
   (when-let ((u (gikopoi-user-by-id userId)))
-    (setf (gikopoi-user-position      u) (cons x y)
-          (gikopoi-user-direction     u) direction
-          (gikopoi-user-last-movement u) lastMovement)
-    (gikopoi--refresh-map-buffer)))
+    (let ((old (gikopoi-user-position u)))
+      (setf (gikopoi-user-position      u) (cons x y)
+            (gikopoi-user-direction     u) direction
+            (gikopoi-user-last-movement u) lastMovement)
+      (when (and gikopoi-map-animate (not (eq isInstant t))
+                 old (not (equal old (cons x y)))
+                 (gikopoi--map-anim-visible-p))
+        (gikopoi--map-start-walk userId old))
+      (gikopoi--refresh-map-buffer))))
 
 (gikopoi-defevent server-bubble-position (id direction)
   (when-let ((u (gikopoi-user-by-id id)))
-    (setf (gikopoi-user-bubble-position u) direction)))
+    (setf (gikopoi-user-bubble-position u) direction)
+    (gikopoi--refresh-map-buffer)))
 
 (gikopoi-defevent server-character-changed (id character-id altp)
   (when-let ((u (gikopoi-user-by-id id)))
@@ -709,11 +723,13 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
 (gikopoi-defevent server-msg (id message)
   (when-let ((u (gikopoi-user-by-id id)))
     (gikopoi-user-msg u message)
-    (gikopoi--refresh-user-list-buffer)))
+    (gikopoi--refresh-user-list-buffer)
+    (gikopoi--refresh-map-buffer)))      ; show/refresh the speech bubble at once
 
 (gikopoi-defevent server-roleplay (id message)
   (when-let ((u (gikopoi-user-by-id id)))
-    (gikopoi-user-roleplay u message)))
+    (gikopoi-user-roleplay u message)
+    (gikopoi--refresh-map-buffer)))
 
 (gikopoi-defevent server-roll-die (id base sum arga &optional argb)
   (when-let ((u (gikopoi-user-by-id id)))
@@ -1178,8 +1194,8 @@ a door or warp — stays visible even with people stacked on it."
    (gikopoi--map-swatch (gikopoi--map-glyph 'blocked) 'gikopoi-map-blocked 'blocked)
    " wall\n"))
 
-(defun gikopoi--render-map ()
-  "Insert the current room map at point."
+(defun gikopoi--render-map-ascii ()
+  "Insert the ASCII top-down room map at point."
   (let ((dim (gikopoi--map-dimensions)))
     (if (not dim)
         (insert "No room map available.\n")
@@ -1204,50 +1220,813 @@ a door or warp — stays visible even with people stacked on it."
                  (insert "\n"))
         (insert (gikopoi--map-legend))))))
 
+;;; ── 16c. Graphical Map ────────────────────────────────────────────────────
+;;;
+;;; Composites the current room as one SVG — the gikopoi2 background, furniture
+;;; objects and character sprites — using the same isometric projection as the
+;;; JS client (`calculateRealCoordinates': origin + (x+y)*bw/2, (x-y)*bh/2),
+;;; then shows it as an image.  Assets are downloaded on demand from the
+;;; gikopoi2 repo and cached under `gikopoi-site-directory'.
+
+(defcustom gikopoi-map-graphical (image-type-available-p 'svg)
+  "When non-nil, draw the room map as composited graphics instead of ASCII."
+  :group 'gikopoi :type 'boolean)
+
+(defcustom gikopoi-map-auto-open t
+  "When non-nil, open the room map automatically on connecting to a server."
+  :group 'gikopoi :type 'boolean)
+
+(defcustom gikopoi-map-asset-base-url
+  "https://raw.githubusercontent.com/iccanobif/gikopoi2/master/public/"
+  "Base URL for downloading room and character SVG assets."
+  :group 'gikopoi :type 'string)
+
+(defcustom gikopoi-map-scale 1.0
+  "Zoom level of the graphical map: higher shows less room, bigger.
+Adjusted with `gikopoi-map-zoom-in'/`-out' (\\`+' / \\`-' in the map)."
+  :group 'gikopoi :type 'number)
+
+(defcustom gikopoi-map-view-width 760
+  "On-screen width, in pixels, of the graphical map window (the camera view).
+The window keeps this size across rooms and zoom; big rooms scroll to follow
+you rather than shrinking to fit."
+  :group 'gikopoi :type 'integer)
+
+(defcustom gikopoi-map-view-height 520
+  "On-screen height, in pixels, of the graphical map window (the camera view)."
+  :group 'gikopoi :type 'integer)
+
+(defcustom gikopoi-map-follow t
+  "When non-nil, the graphical-map camera centres on you in rooms bigger than
+the view; otherwise it centres on the room."
+  :group 'gikopoi :type 'boolean)
+
+(defcustom gikopoi-map-show-names t
+  "When non-nil, draw each user's name above their sprite on the graphical map."
+  :group 'gikopoi :type 'boolean)
+
+(defcustom gikopoi-map-show-bubbles t
+  "When non-nil, draw speech bubbles for users' current messages on the map.
+A bubble stays up as long as the user keeps that message active."
+  :group 'gikopoi :type 'boolean)
+
+(defconst gikopoi--map-block-w 80 "Default isometric block width (gikopoi2 BLOCK_WIDTH).")
+(defconst gikopoi--map-block-h 40 "Default isometric block height (gikopoi2 BLOCK_HEIGHT).")
+(defconst gikopoi--map-char-scale 0.5 "Character sprite scale (gikopoi2 default).")
+
+(defcustom gikopoi-map-animate t
+  "When non-nil, animate walking on the graphical map."
+  :group 'gikopoi :type 'boolean)
+
+(defcustom gikopoi-map-anim-fps 15
+  "Frames per second for graphical-map walk animation."
+  :group 'gikopoi :type 'number)
+
+(defvar gikopoi--asset-datauri-cache (make-hash-table :test 'equal))
+(defvar gikopoi--asset-dims-cache    (make-hash-table :test 'equal))
+(defvar-local gikopoi--map-current-image nil "Image object last drawn in the map buffer.")
+(defvar gikopoi--map-last-size nil "Last (W . H) px the graphical map was rendered at.")
+(defvar gikopoi--map-vsize nil "Cached (W . H) px of the map view; stable between resizes.")
+(defvar gikopoi--map-cam nil "Remembered camera origin (VX . VY) for the current room.")
+(defvar gikopoi--map-cam-room nil "Room id the remembered camera belongs to.")
+
+(defun gikopoi--map-camera (cw ch vw vh ccx ccy _rid)
+  "Return camera origin (VX . VY) that simply follows the target (CCX . CCY).
+Keeps you centred (clamped to the room), scrolling the room smoothly as you
+walk — no dead-zone snapping, so it never jumps to re-centre after a move.
+Rooms smaller than the view are centred and stay put."
+  (cons (gikopoi--camera-clamp (- ccx (/ vw 2)) cw vw)
+        (gikopoi--camera-clamp (- ccy (/ vh 2)) ch vh)))
+
+(defun gikopoi--map-view-size ()
+  "Return the target (WIDTH . HEIGHT) in pixels for the map image.
+Fills the map window when it is displayed, so the room view is responsive;
+falls back to `gikopoi-map-view-width'/`-height' before the window exists."
+  (let ((win (and (buffer-live-p gikopoi-map-buffer)
+                  (get-buffer-window gikopoi-map-buffer t))))
+    (if (and win (fboundp 'window-body-width))
+        (cons (max 200 (- (window-body-width  win t) 6))
+              (max 150 (- (window-body-height win t) 6)))
+      (cons gikopoi-map-view-width gikopoi-map-view-height))))
+
+(defvar gikopoi--map-anim (make-hash-table :test 'equal)
+  "Per-user walk animation state: user-id -> plist (:px :py :walking :phase).
+:px/:py are the sprite's current feet position in scaled pixels.")
+(defvar gikopoi--map-anim-timer nil "Active animation timer, or nil.")
+(defvar gikopoi--map-fitted-room nil
+  "Room id the map window was last fitted to; avoids resizing on every move.")
+
+(defun gikopoi--n (x) "Format number X for an SVG attribute." (format "%g" x))
+
+(defun gikopoi--xml-escape (s)
+  (replace-regexp-in-string
+   "[<>&\"]" (lambda (m) (pcase m ("<" "&lt;") (">" "&gt;") ("&" "&amp;") ("\"" "&quot;")))
+   (or s "")))
+
+(defun gikopoi--asset-cache-dir ()
+  (or gikopoi-site-directory
+      (expand-file-name "assets" gikopoi-default-directory)))
+
+(defun gikopoi--asset-file (relpath)
+  "Return the local cached path of asset RELPATH, downloading it if missing.
+Return nil when the asset cannot be fetched."
+  (let ((local (expand-file-name relpath (gikopoi--asset-cache-dir))))
+    (if (file-exists-p local)
+        local
+      (make-directory (file-name-directory local) t)
+      (condition-case nil
+          (progn
+            (url-copy-file (concat gikopoi-map-asset-base-url relpath) local t)
+            (if (and (file-exists-p local)
+                     (> (file-attribute-size (file-attributes local)) 0))
+                local
+              (ignore-errors (delete-file local)) nil))
+        (error (ignore-errors (delete-file local)) nil)))))
+
+(defun gikopoi--asset-dims (file)
+  "Return (WIDTH . HEIGHT) parsed from SVG FILE, or nil."
+  (or (gethash file gikopoi--asset-dims-cache)
+      (puthash
+       file
+       (with-temp-buffer
+         (set-buffer-multibyte nil)
+         (insert-file-contents-literally file nil 0 4000)
+         (goto-char (point-min))
+         (let (w h)
+           (when (re-search-forward "<svg[^>]*>" nil t)
+             (let ((tag (match-string 0)))
+               (when (string-match "width=\"\\([0-9.]+\\)" tag)
+                 (setq w (string-to-number (match-string 1 tag))))
+               (when (string-match "height=\"\\([0-9.]+\\)" tag)
+                 (setq h (string-to-number (match-string 1 tag))))
+               (when (and (not (and w h))
+                          (string-match
+                           "viewBox=\"[-0-9.]+ +[-0-9.]+ +\\([0-9.]+\\) +\\([0-9.]+\\)" tag))
+                 (setq w (or w (string-to-number (match-string 1 tag)))
+                       h (or h (string-to-number (match-string 2 tag)))))))
+           (and w h (cons w h))))
+       gikopoi--asset-dims-cache)))
+
+(defun gikopoi--asset-datauri (file)
+  "Return a base64 data: URI embedding FILE (cached)."
+  (or (gethash file gikopoi--asset-datauri-cache)
+      (puthash
+       file
+       (let ((mime (if (string-suffix-p ".png" file) "image/png" "image/svg+xml")))
+         (with-temp-buffer
+           (set-buffer-multibyte nil)
+           (insert-file-contents-literally file)
+           (concat "data:" mime ";base64,"
+                   (base64-encode-string (buffer-string) t))))
+       gikopoi--asset-datauri-cache)))
+
+;;; --- Bulk asset download ----------------------------------------------------
+;;;
+;;; On-demand fetching (`gikopoi--asset-file') already grabs whatever a new
+;;; room or character needs the first time it appears.  These commands let you
+;;; pre-pull *all* static assets up front, or re-pull them when the upstream
+;;; rooms/characters change.
+
+(defcustom gikopoi-map-asset-manifest-url
+  "https://api.github.com/repos/iccanobif/gikopoi2/git/trees/master?recursive=1"
+  "GitHub tree API URL used to enumerate all downloadable static assets."
+  :group 'gikopoi :type 'string)
+
+(defconst gikopoi--dl-concurrency 8 "Parallel downloads for a bulk asset pull.")
+(defvar gikopoi--dl-queue nil)
+(defvar gikopoi--dl-total 0)
+(defvar gikopoi--dl-done  0)
+(defvar gikopoi--dl-active 0)
+
+(defun gikopoi--asset-manifest ()
+  "Return the list of asset relpaths (under public/) from the upstream repo."
+  (with-current-buffer
+      (url-retrieve-synchronously gikopoi-map-asset-manifest-url t t 30)
+    (goto-char (point-min))
+    (unless (re-search-forward "\n\n" nil t)
+      (error "Gikopoi: bad response from asset manifest"))
+    (let* ((data (json-parse-buffer :object-type 'alist :array-type 'list))
+           (tree (alist-get 'tree data))
+           (out  '()))
+      (dolist (e tree (nreverse out))
+        (let ((path (alist-get 'path e)))
+          (when (and (stringp path)
+                     (string-match-p "\\`public/\\(rooms\\|characters\\)/" path)
+                     (string-match-p "\\.\\(svg\\|png\\)\\'" path))
+            (push (substring path (length "public/")) out)))))))
+
+(defun gikopoi--download-file-async (relpath callback)
+  "Download RELPATH into the asset cache asynchronously, then call CALLBACK."
+  (let ((local (expand-file-name relpath (gikopoi--asset-cache-dir)))
+        (url   (concat gikopoi-map-asset-base-url relpath)))
+    (make-directory (file-name-directory local) t)
+    (condition-case nil
+        (url-retrieve
+         url
+         (lambda (status)
+           (unwind-protect
+               (when (and (not (plist-get status :error))
+                          (progn (goto-char (point-min))
+                                 (re-search-forward "\n\n" nil t)))
+                 (let ((coding-system-for-write 'binary))
+                   (write-region (point) (point-max) local nil 'silent)))
+             (kill-buffer (current-buffer))
+             (funcall callback)))
+         nil t t)
+      (error (funcall callback)))))
+
+(defun gikopoi--dl-next ()
+  (if gikopoi--dl-queue
+      (let ((relpath (pop gikopoi--dl-queue)))
+        (cl-incf gikopoi--dl-active)
+        (gikopoi--download-file-async
+         relpath
+         (lambda ()
+           (cl-decf gikopoi--dl-active)
+           (cl-incf gikopoi--dl-done)
+           (when (zerop (% gikopoi--dl-done 25))
+             (message "Gikopoi: downloading assets… %d/%d"
+                      gikopoi--dl-done gikopoi--dl-total))
+           (gikopoi--dl-next))))
+    (when (zerop gikopoi--dl-active)
+      (clrhash gikopoi--asset-datauri-cache)
+      (clrhash gikopoi--asset-dims-cache)
+      (message "Gikopoi: finished downloading %d assets." gikopoi--dl-done)
+      (ignore-errors (gikopoi--refresh-map-buffer)))))
+
+(defun gikopoi-map-download-assets (&optional force)
+  "Download all gikopoi static room and character assets into the cache.
+Without a prefix arg, only missing files are fetched.  With a prefix arg
+\\[universal-argument] FORCE, re-download everything (use this when the
+upstream rooms or characters have been updated)."
+  (interactive "P")
+  (when (and gikopoi--dl-queue (> gikopoi--dl-active 0))
+    (user-error "Gikopoi: a download is already in progress"))
+  (message "Gikopoi: fetching asset list…")
+  (let* ((all (gikopoi--asset-manifest))
+         (todo (if force
+                   all
+                 (cl-remove-if
+                  (lambda (r) (file-exists-p (expand-file-name r (gikopoi--asset-cache-dir))))
+                  all))))
+    (if (null todo)
+        (message "Gikopoi: all %d assets already cached." (length all))
+      (setq gikopoi--dl-queue  todo
+            gikopoi--dl-total  (length todo)
+            gikopoi--dl-done   0
+            gikopoi--dl-active 0)
+      (message "Gikopoi: downloading %d assets (of %d)…" (length todo) (length all))
+      (dotimes (_ (min gikopoi--dl-concurrency gikopoi--dl-total))
+        (gikopoi--dl-next)))))
+
+(defun gikopoi--img-el (file px py w h &optional mirror)
+  "Return an SVG <image> element for FILE at (PX,PY) sized WxH, optionally MIRRORed."
+  (let ((uri (gikopoi--asset-datauri file)))
+    (if mirror
+        (format "<g transform=\"translate(%s,0) scale(-1,1)\"><image x=\"0\" y=\"%s\" width=\"%s\" height=\"%s\" xlink:href=\"%s\"/></g>"
+                (gikopoi--n (+ px w)) (gikopoi--n py) (gikopoi--n w) (gikopoi--n h) uri)
+      (format "<image x=\"%s\" y=\"%s\" width=\"%s\" height=\"%s\" xlink:href=\"%s\"/>"
+              (gikopoi--n px) (gikopoi--n py) (gikopoi--n w) (gikopoi--n h) uri))))
+
+(defun gikopoi--user-sprite-spec (u sit-set walking phase)
+  "Return (SIDE STATE MIRROR) for user U, given the room's SIT-SET hash.
+Mirrors the gikopoi2 client: back when facing up/left, mirrored when left/down.
+When WALKING, alternate the two walk frames according to PHASE."
+  (let* ((dir (or (gikopoi-user-direction u) "down"))
+         (pos (gikopoi-user-position u))
+         (sitting (and pos (gethash (cons (car pos) (cdr pos)) sit-set))))
+    (list (if (member dir '("up" "left")) "back" "front")
+          (cond (walking (if (cl-evenp (floor (/ phase 3.0))) "walking-1" "walking-2"))
+                (sitting "sitting")
+                (t       "standing"))
+          (and (member dir '("left" "down")) t))))
+
+;;; --- Walk animation ---------------------------------------------------------
+
+(defun gikopoi--tile-feet (x y)
+  "Return the sprite feet position (PX . PY) in background pixels for tile X,Y."
+  (let* ((assets (gikopoi--room-assets))
+         (origin (alist-get 'originCoordinates assets))
+         (ox     (or (alist-get 'x origin) 0))
+         (oy     (or (alist-get 'y origin) 0))
+         (bw     (or (alist-get 'blockWidth assets) gikopoi--map-block-w))
+         (bh     (or (alist-get 'blockHeight assets) gikopoi--map-block-h))
+         (rx     (+ ox (/ (* (+ x y) bw) 2.0)))
+         (ry     (+ oy (/ (* (- x y) bh) 2.0))))
+    (cons (+ rx (/ bw 2.0)) ry)))
+
+(defun gikopoi--current-user-feet ()
+  "Return the local user's feet position (CX . FY) in background pixels, or nil.
+Uses the animated position while walking so the camera follows smoothly."
+  (when-let ((u gikopoi-current-user)
+             (pos (gikopoi-user-position u)))
+    (let ((e (gethash (gikopoi-user-id u) gikopoi--map-anim)))
+      (if (and e (plist-get e :walking))
+          (cons (plist-get e :px) (plist-get e :py))
+        (gikopoi--tile-feet (car pos) (cdr pos))))))
+
+(defun gikopoi--camera-clamp (v content region)
+  "Clamp camera origin V so a REGION-sized view stays over CONTENT pixels.
+If CONTENT is smaller than REGION, centre it (result may be negative)."
+  (if (<= content region)
+      (/ (- content region) 2.0)
+    (max 0.0 (min (float v) (- content region)))))
+
+(defun gikopoi--walk-speed ()
+  "Walk speed in background pixels per millisecond, matching the gikopoi2 client."
+  (let* ((assets (gikopoi--room-assets))
+         (bw (or (alist-get 'blockWidth assets) gikopoi--map-block-w)))
+    (* bw 0.0015
+       (if (equal (gikopoi-room-id gikopoi-current-room) "long_st") 2 1))))
+
+(defun gikopoi--map-anim-stop ()
+  (when gikopoi--map-anim-timer
+    (cancel-timer gikopoi--map-anim-timer)
+    (setq gikopoi--map-anim-timer nil)))
+
+(defun gikopoi--map-anim-reset ()
+  "Clear all walk-animation state and stop the timer (e.g. on room change)."
+  (clrhash gikopoi--map-anim)
+  (gikopoi--map-anim-stop))
+
+(defun gikopoi--map-anim-visible-p ()
+  (and gikopoi-map-graphical gikopoi-current-room
+       (buffer-live-p gikopoi-map-buffer)
+       (get-buffer-window gikopoi-map-buffer t)))
+
+(defun gikopoi--map-start-walk (id old-pos)
+  "Begin animating user ID walking away from OLD-POS (its previous tile)."
+  (let* ((e    (gethash id gikopoi--map-anim))
+         (seed (if (and e (plist-get e :walking))
+                   (cons (plist-get e :px) (plist-get e :py))   ; continue mid-walk
+                 (gikopoi--tile-feet (car old-pos) (cdr old-pos)))))
+    (puthash id (list :px (car seed) :py (cdr seed) :walking t
+                      :phase (if e (plist-get e :phase) 0))
+             gikopoi--map-anim))
+  (unless gikopoi--map-anim-timer
+    (setq gikopoi--map-anim-timer
+          (run-at-time 0 (/ 1.0 (max 1 gikopoi-map-anim-fps))
+                       #'gikopoi--map-anim-tick))))
+
+(defun gikopoi--map-anim-tick ()
+  "Advance every walking sprite toward its tile, redraw, and stop when idle."
+  (condition-case err
+      (if (not (gikopoi--map-anim-visible-p))
+          (gikopoi--map-anim-reset)
+        (let ((moving nil)
+              (step   (* (gikopoi--walk-speed) (/ 1000.0 (max 1 gikopoi-map-anim-fps)))))
+          (maphash
+           (lambda (id e)
+             (when (plist-get e :walking)
+               (let ((u (gikopoi-user-by-id id)))
+                 (if (not u)
+                     (remhash id gikopoi--map-anim)
+                   (let* ((pos  (gikopoi-user-position u))
+                          (feet (gikopoi--tile-feet (car pos) (cdr pos)))
+                          (px   (plist-get e :px)) (py (plist-get e :py))
+                          (dx   (- (car feet) px)) (dy (- (cdr feet) py))
+                          (dist (sqrt (+ (* dx dx) (* dy dy)))))
+                     (if (<= dist step)
+                         (setq e (plist-put (plist-put e :px (car feet))
+                                            :py (cdr feet))
+                               e (plist-put e :walking nil))
+                       (setq e (plist-put e :px (+ px (* step (/ dx dist))))
+                             e (plist-put e :py (+ py (* step (/ dy dist))))
+                             e (plist-put e :phase (1+ (plist-get e :phase))))
+                       (setq moving t))
+                     (puthash id e gikopoi--map-anim))))))
+           gikopoi--map-anim)
+          (gikopoi--map-draw)
+          (unless moving (gikopoi--map-anim-stop))))
+    (error (gikopoi--map-anim-stop)
+           (message "Gikopoi anim error: %s" (error-message-string err)))))
+
+(defun gikopoi--sprite-file (char-id side state alt)
+  "Return the cached sprite file for CHAR-ID, trying alt/normal and svg/png."
+  (when char-id
+    (or (and alt (gikopoi--asset-file (format "characters/%s/%s-%s-alt.svg" char-id side state)))
+        (gikopoi--asset-file (format "characters/%s/%s-%s.svg" char-id side state))
+        (gikopoi--asset-file (format "characters/%s/%s-%s.png" char-id side state)))))
+
+(defcustom gikopoi-map-bubble-opacity 0.97
+  "Opacity of speech-bubble backgrounds on the graphical map (0..1)."
+  :group 'gikopoi :type 'number)
+
+(defun gikopoi--wrap-message (msg maxcols maxlines)
+  "Split MSG into at most MAXLINES lines of at most MAXCOLS display columns."
+  (let ((out '()))
+    (catch 'done
+      (dolist (para (split-string (or msg "") "[\r\n]+"))
+        (let ((sline para))
+          (if (string-empty-p sline)
+              (when (>= (length out) maxlines) (throw 'done nil))
+            (while (and sline (not (string-empty-p sline)))
+              (when (>= (length out) maxlines) (throw 'done nil))
+              (let ((i 0) (w 0))
+                (while (and (< i (length sline))
+                            (<= (+ w (char-width (aref sline i))) maxcols))
+                  (setq w (+ w (char-width (aref sline i))) i (1+ i)))
+                (setq i (max 1 i))
+                (let ((seg (string-trim (substring sline 0 i))))
+                  (unless (string-empty-p seg) (push seg out)))
+                (setq sline (substring sline i)))))))
+      nil)
+    (or (nreverse out) (list ""))))
+
+(defun gikopoi--text-px (s size)
+  "Rough rendered width of string S at font SIZE, for sizing boxes to the text.
+Per-character estimate for a bold sans-serif font, so boxes hug the text
+instead of leaving whitespace on the right."
+  (let ((u 0.0))
+    (dolist (c (append s nil))
+      (setq u (+ u (cond ((> c 127) 1.05)                                   ; CJK / wide
+                         ((memq c '(?i ?l ?j ?I ?t ?f ?\. ?, ?' ?\; ?: ?! ?| ?\s)) 0.30)
+                         ((memq c '(?m ?w ?M ?W ?@)) 0.92)
+                         ((and (>= c ?A) (<= c ?Z)) 0.68)
+                         ((and (>= c ?0) (<= c ?9)) 0.56)
+                         (t 0.52))))) ; lowercase average
+    (* u size)))
+
+(defun gikopoi--name-tag-el (name cx top mine)
+  "Return a gikopoi2-style name tag for NAME centred at CX, above head y TOP.
+Bold text (red for MINE, else blue) on a translucent white background —
+readable on any room, matching the JS client's `getNameImage'."
+  (let* ((segs  (split-string name "◆"))
+         (disp  (car segs))
+         (trip  (cadr segs))
+         (lines (delq nil (list (and (not (string-empty-p (or disp ""))) disp)
+                                (and trip (concat "◆" trip)))))
+         (lh 13)
+         (h  (+ (* (length lines) lh) 3))
+         ;; generous so the tag always covers the bold text end-to-end
+         (w  (+ 6 (* 7.5 (apply #'max 1 (mapcar #'string-width lines)))))
+         (bx (- cx (/ w 2)))
+         (by (- top h 1))
+         (color (if mine "red" "blue")))
+    (concat
+     "<g>"
+     (format "<rect x=\"%s\" y=\"%s\" width=\"%s\" height=\"%s\" fill=\"#ffffff\" fill-opacity=\"0.5\"/>"
+             (gikopoi--n bx) (gikopoi--n by) (gikopoi--n w) (gikopoi--n h))
+     (let ((i 0) (acc ""))
+       (dolist (ln lines acc)
+         (setq acc (concat acc
+                           (format "<text x=\"%s\" y=\"%s\" text-anchor=\"middle\" font-size=\"13\" font-weight=\"bold\" font-family=\"Arial,Helvetica,sans-serif\" fill=\"%s\">%s</text>"
+                                   (gikopoi--n cx) (gikopoi--n (+ by (* lh i) (- lh 2)))
+                                   color (gikopoi--xml-escape ln)))
+               i (1+ i))))
+     "</g>")))
+
+(defun gikopoi--bubble-el (msg cx fy bpos)
+  "Return a gikopoi2-style speech bubble for MSG.
+CX/FY are the sprite centre-x and feet-y in background pixels; BPOS the bubble
+side (\"up\"/\"down\"/\"left\"/\"right\").  The bubble is a borderless
+translucent white box with a triangular tail toward the speaker, placed with
+the same offsets the JS client uses."
+  (let* ((lines  (gikopoi--wrap-message (string-trim msg) 35 5))
+         (padx 4) (pady 3) (lh 15) (fs 13) (a 6)
+         (tw     (apply #'max (mapcar (lambda (l) (gikopoi--text-px l fs)) lines)))
+         (w      (+ tw (* 2 padx)))
+         (h      (+ (* (length lines) lh) (* 2 pady)))
+         ;; placement (drawBubbles): pos0 => right side, pos1 => lower
+         (pos0   (member bpos '("up" "right")))
+         (pos1   (member bpos '("down" "right")))
+         (bx     (+ cx (if pos0 21 (- -21 w))))
+         (by     (- fy (if pos1 62 (+ 70 h))))
+         (fill   (format "fill=\"#ffffff\" fill-opacity=\"%s\"" gikopoi-map-bubble-opacity))
+         ;; triangular tail at the corner nearest the avatar
+         (tail   (pcase bpos
+                   ("up"    (list (cons bx (- (+ by h) a)) (cons (+ bx a) (+ by h))
+                                  (cons (- bx a) (+ (+ by h) a))))
+                   ("down"  (list (cons (- (+ bx w) a) by) (cons (+ bx w) (+ by a))
+                                  (cons (+ (+ bx w) a) (- by a))))
+                   ("left"  (list (cons (- (+ bx w) a) (+ by h)) (cons (+ bx w) (- (+ by h) a))
+                                  (cons (+ (+ bx w) a) (+ (+ by h) a))))
+                   (_       (list (cons (+ bx a) by) (cons bx (+ by a))
+                                  (cons (- bx a) (- by a)))))))
+    (concat
+     "<g>"
+     ;; tail (drawn first, base tucked under the box)
+     (format "<polygon points=\"%s\" %s/>"
+             (mapconcat (lambda (p) (format "%s,%s" (gikopoi--n (car p)) (gikopoi--n (cdr p))))
+                        tail " ")
+             fill)
+     ;; box
+     (format "<rect x=\"%s\" y=\"%s\" width=\"%s\" height=\"%s\" %s/>"
+             (gikopoi--n bx) (gikopoi--n by) (gikopoi--n w) (gikopoi--n h) fill)
+     ;; text lines
+     (let ((i 0) (acc ""))
+       (dolist (ln lines acc)
+         (setq acc (concat acc
+                           (format "<text x=\"%s\" y=\"%s\" font-size=\"%s\" font-family=\"'MS PGothic',sans-serif\" fill=\"#000000\">%s</text>"
+                                   (gikopoi--n (+ bx padx))
+                                   (gikopoi--n (+ by pady (* lh i) (- lh 3)))
+                                   fs (gikopoi--xml-escape ln)))
+               i (1+ i))))
+     "</g>")))
+
+(defun gikopoi--map-svg ()
+  "Compose and return the current room as an SVG string, or nil if unavailable."
+  (let* ((assets (gikopoi--room-assets))
+         (bgurl  (alist-get 'backgroundImageUrl assets))
+         (bgfile (and bgurl (gikopoi--asset-file bgurl))))
+    (when bgfile
+      (let* ((s      (or (alist-get 'scale assets) 1))
+             (dims   (or (gikopoi--asset-dims bgfile) '(721 . 511)))
+             (cw     (* s (car dims)))
+             (ch     (* s (cdr dims)))
+             (origin (alist-get 'originCoordinates assets))
+             (ox     (or (alist-get 'x origin) 0))
+             (oy     (or (alist-get 'y origin) 0))
+             (bw     (or (alist-get 'blockWidth assets) gikopoi--map-block-w))
+             (bh     (or (alist-get 'blockHeight assets) gikopoi--map-block-h))
+             (sy     (or (alist-get 'y (alist-get 'size assets)) 0))
+             (sit    (gikopoi--coords->set (alist-get 'sit assets)))
+             (rid    (gikopoi-room-id gikopoi-current-room))
+             (items   '())
+             (parts   '())
+             (bubbles '()))
+        (cl-flet ((realx (x y) (+ ox (/ (* (+ x y) bw) 2.0)))
+                  (realy (x y) (+ oy (/ (* (- x y) bh) 2.0))))
+          ;; --- gather objects ---
+          (dolist (o (append (alist-get 'objects assets) nil))
+            (unless (eq (alist-get 'isHidden o) t)
+              (let* ((url (alist-get 'url o))
+                     (url (if (vectorp url) (and (> (length url) 0) (aref url 0)) url))
+                     (off (alist-get 'offset o))
+                     (osc (or (alist-get 'scale o) 1)))
+                ;; positions/sizes are in raw background-pixel space; only the
+                ;; background itself is scaled by the room `scale' (see canvas).
+                (when url
+                  (push (list :prio (+ (alist-get 'x o) 1 (- sy (alist-get 'y o)))
+                              :type 'object :oscale osc
+                              :relpath (concat "rooms/" rid "/" url)
+                              :px (* (or (alist-get 'x off) 0) osc)
+                              :py (* (or (alist-get 'y off) 0) osc))
+                        items)))))
+          ;; --- gather users ---
+          (dolist (u (gikopoi-room-users gikopoi-current-room))
+            (unless (gikopoi-user-ignored-p u)
+              (when-let ((pos (gikopoi-user-position u)))
+                (push (list :prio (+ (car pos) 1 (- sy (cdr pos)))
+                            :type 'user :user u :x (car pos) :y (cdr pos))
+                      items))))
+          ;; --- painter's order: lower priority first, objects before users on tie ---
+          (setq items
+                (sort items
+                      (lambda (a b)
+                        (let ((pa (plist-get a :prio)) (pb (plist-get b :prio)))
+                          (if (= pa pb)
+                              (and (eq (plist-get a :type) 'object)
+                                   (eq (plist-get b :type) 'user))
+                            (< pa pb))))))
+          ;; --- emit ---
+          (dolist (it items)
+            (pcase (plist-get it :type)
+              ('object
+               (when-let* ((file (gikopoi--asset-file (plist-get it :relpath)))
+                           (d    (gikopoi--asset-dims file)))
+                 (push (gikopoi--img-el file (plist-get it :px) (plist-get it :py)
+                                        (* (plist-get it :oscale) (car d))
+                                        (* (plist-get it :oscale) (cdr d)))
+                       parts)))
+              ('user
+               (let* ((u       (plist-get it :user))
+                      (x       (plist-get it :x)) (y (plist-get it :y))
+                      (e       (gethash (gikopoi-user-id u) gikopoi--map-anim))
+                      (walking (and e (plist-get e :walking)))
+                      (spec    (gikopoi--user-sprite-spec
+                                u sit walking (if e (plist-get e :phase) 0)))
+                      (file    (gikopoi--sprite-file (gikopoi-user-character-id u)
+                                                     (nth 0 spec) (nth 1 spec)
+                                                     (gikopoi-user-alt-p u)))
+                      (cx      (if walking (plist-get e :px) (+ (realx x y) (/ bw 2.0))))
+                      (fy      (if walking (plist-get e :py) (realy x y)))
+                      (ghost   (not (gikopoi-user-active-p u)))
+                      (top     fy)
+                      (sprite  nil))
+                 (if-let ((d (and file (gikopoi--asset-dims file))))
+                     (let* ((w  (* gikopoi--map-char-scale (car d)))
+                            (hh (* gikopoi--map-char-scale (cdr d))))
+                       (setq top (- fy hh)
+                             sprite (gikopoi--img-el file (- cx (/ w 2)) top w hh (nth 2 spec))))
+                   ;; fallback marker so positions still show without a sprite
+                   (setq top (- fy 26)
+                         sprite (format "<circle cx=\"%s\" cy=\"%s\" r=\"8\" fill=\"%s\" stroke=\"#000\"/>"
+                                        (gikopoi--n cx) (gikopoi--n (- fy 8))
+                                        (or (ignore-errors (gikopoi-user-name-color u)) "#ff4040"))))
+                 ;; idle/away users render as a translucent ghost
+                 (push (if ghost (format "<g opacity=\"0.5\">%s</g>" sprite) sprite) parts)
+                 ;; name tag (gikopoi2 style: blue/red bold on translucent white)
+                 (when gikopoi-map-show-names
+                   (let ((label (substring-no-properties (or (gikopoi-user-name u) ""))))
+                     (unless (string-empty-p label)
+                       (push (gikopoi--name-tag-el
+                              label cx top (eq u gikopoi-current-user))
+                             parts))))
+                 ;; speech bubble — persists as long as the user keeps the message
+                 (when gikopoi-map-show-bubbles
+                   (let ((msg (gikopoi-user-last-message u)))
+                     (when (and msg (not (string-empty-p (string-trim msg))))
+                       (push (gikopoi--bubble-el
+                              msg cx fy (or (gikopoi-user-bubble-position u) "up"))
+                             bubbles))))))))
+          ;; camera: a fixed-size view (so the window keeps its size), zoomed
+          ;; via the viewBox and centred on the local user in big rooms.
+          (let* ((size (or gikopoi--map-vsize (gikopoi--map-view-size)))
+                 (sw   (car size)) (sh (cdr size))
+                 (zoom (max 0.1 gikopoi-map-scale))
+                 (vw   (/ sw zoom))
+                 (vh   (/ sh zoom))
+                 (feet (and gikopoi-map-follow (gikopoi--current-user-feet)))
+                 (ccx  (if feet (car feet) (/ cw 2.0)))
+                 (ccy  (if feet (- (cdr feet) 60) (/ ch 2.0)))
+                 (cam  (gikopoi--map-camera cw ch vw vh ccx ccy rid))
+                 (vx   (car cam))
+                 (vy   (cdr cam)))
+            (setq gikopoi--map-last-size size)
+            (concat
+             (format "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"%s\" height=\"%s\" viewBox=\"%s %s %s %s\">"
+                     sw sh
+                     (gikopoi--n vx) (gikopoi--n vy) (gikopoi--n vw) (gikopoi--n vh))
+             (format "<rect x=\"%s\" y=\"%s\" width=\"%s\" height=\"%s\" fill=\"%s\"/>"
+                     (gikopoi--n vx) (gikopoi--n vy) (gikopoi--n vw) (gikopoi--n vh)
+                     (or (alist-get 'backgroundColor assets) "#000000"))
+             (gikopoi--img-el bgfile 0 0 cw ch)
+             (mapconcat #'identity (nreverse parts) "")
+             (mapconcat #'identity (nreverse bubbles) "")  ; bubbles above everyone
+             "</svg>")))))))
+
 (define-derived-mode gikopoi-map-mode special-mode "Gikopoi-Map"
   "Major mode for the Gikopoi room map buffer."
   :group 'gikopoi
   (setq truncate-lines t))
 
-(define-key gikopoi-map-mode-map (kbd "g") #'gikopoi-show-map)
+(define-key gikopoi-map-mode-map (kbd "g")   #'gikopoi-show-map)
+(define-key gikopoi-map-mode-map (kbd "t")   #'gikopoi-map-toggle-graphics)
+(define-key gikopoi-map-mode-map (kbd "D")   #'gikopoi-map-download-assets)
+(define-key gikopoi-map-mode-map (kbd "+")   #'gikopoi-map-zoom-in)
+(define-key gikopoi-map-mode-map (kbd "=")   #'gikopoi-map-zoom-in)
+(define-key gikopoi-map-mode-map (kbd "-")   #'gikopoi-map-zoom-out)
+(define-key gikopoi-map-mode-map (kbd "0")   #'gikopoi-map-zoom-reset)
+(define-key gikopoi-map-mode-map (kbd "b")   #'gikopoi-map-cycle-bubble)
+(define-key gikopoi-map-mode-map (kbd "c")   #'gikopoi-map-recenter)
+
+;; Play from the map buffer too, not just the chat buffer: walk, chat, bubble.
+(define-key gikopoi-map-mode-map (kbd "<left>")    #'gikopoi-move-left)
+(define-key gikopoi-map-mode-map (kbd "<right>")   #'gikopoi-move-right)
+(define-key gikopoi-map-mode-map (kbd "<up>")      #'gikopoi-move-up)
+(define-key gikopoi-map-mode-map (kbd "<down>")    #'gikopoi-move-down)
+(define-key gikopoi-map-mode-map (kbd "<C-left>")  #'gikopoi-bubble-left)
+(define-key gikopoi-map-mode-map (kbd "<C-right>") #'gikopoi-bubble-right)
+(define-key gikopoi-map-mode-map (kbd "<C-up>")    #'gikopoi-bubble-up)
+(define-key gikopoi-map-mode-map (kbd "<C-down>")  #'gikopoi-bubble-down)
+(define-key gikopoi-map-mode-map (kbd "SPC")       #'gikopoi-open-minibuffer)
+(define-key gikopoi-map-mode-map (kbd "RET")       #'gikopoi-send-blank)
+(define-key gikopoi-map-mode-map (kbd "r")         #'gikopoi-rula)
+(define-key gikopoi-map-mode-map (kbd "R")         #'gikopoi-list-users)
+
+(defun gikopoi-map-cycle-bubble ()
+  "Cycle your own speech-bubble position: up -> right -> down -> left."
+  (interactive)
+  (let* ((order '("up" "right" "down" "left"))
+         (cur   (and gikopoi-current-user
+                     (gikopoi-user-bubble-position gikopoi-current-user)))
+         (next  (or (cadr (member cur order)) (car order))))
+    (gikopoi-bubble-position next)
+    (message "Bubble position: %s" next)))
+
+(defun gikopoi-map-toggle-graphics ()
+  "Toggle the room map between composited graphics and the ASCII grid.
+On a text terminal (no SVG image support) the map always uses ASCII."
+  (interactive)
+  (if (and (not gikopoi-map-graphical) (not (image-type-available-p 'svg)))
+      (message "Gikopoi: graphical map needs a GUI with SVG support; using ASCII")
+    (setq gikopoi-map-graphical (not gikopoi-map-graphical))
+    (gikopoi--map-draw)
+    (gikopoi--map-fit-windows)           ; graphics/ASCII differ in size
+    (message "Gikopoi map: %s" (if gikopoi-map-graphical "graphical" "ASCII"))))
+
+(defun gikopoi-map-zoom (factor)
+  "Multiply the graphical-map zoom by FACTOR and redraw.
+Zooming lets big rooms (e.g. `silo') fit the window; `0' resets to 100%."
+  (setq gikopoi-map-scale (max 0.1 (min 6.0 (* gikopoi-map-scale factor))))
+  (gikopoi--map-draw)
+  (gikopoi--map-fit-windows)
+  (message "Gikopoi map zoom: %d%%" (round (* 100 gikopoi-map-scale))))
+
+(defun gikopoi-map-zoom-in ()    (interactive) (gikopoi-map-zoom 1.25))
+(defun gikopoi-map-zoom-out ()   (interactive) (gikopoi-map-zoom 0.8))
+(defun gikopoi-map-zoom-reset ()
+  (interactive)
+  (setq gikopoi-map-scale 1.0)
+  (gikopoi--map-draw) (gikopoi--map-fit-windows)
+  (message "Gikopoi map zoom: 100%%"))
+
+(defun gikopoi--map-graphical-p ()
+  (and gikopoi-map-graphical (image-type-available-p 'svg)))
 
 (defun gikopoi--map-draw ()
-  "Render the room map into its buffer."
+  "Render the room map into its buffer.
+For the graphical map the image's `display' property is swapped in place — the
+buffer is not erased and point/window-start don't move — so repeated redraws
+during movement don't make the window shake or the view jump."
   (when (buffer-live-p gikopoi-map-buffer)
     (with-current-buffer gikopoi-map-buffer
-      (let ((inhibit-read-only t))
-        (erase-buffer)
-        (gikopoi--render-map)
-        (goto-char (point-min))))))
+      (let ((inhibit-read-only t)
+            (svg (and (gikopoi--map-graphical-p)
+                      (condition-case err (gikopoi--map-svg)
+                        (error (message "Gikopoi map: %s" (error-message-string err)) nil)))))
+        (if (not svg)
+            (progn (setq gikopoi--map-current-image nil)
+                   (erase-buffer)
+                   (gikopoi--render-map-ascii)
+                   (goto-char (point-min)))
+          (let ((img (create-image svg 'svg t :scale 1.0)))
+            (setq gikopoi--map-current-image img)
+            (if (and (> (buffer-size) 0)
+                     (get-text-property (point-min) 'display))
+                (put-text-property (point-min) (point-max) 'display img)
+              (erase-buffer)
+              (insert-image img))
+            ;; Pin every map window to the top-left corner so a redraw can't
+            ;; make the image jitter by scrolling to keep point in view.
+            (goto-char (point-min))
+            (dolist (w (get-buffer-window-list gikopoi-map-buffer nil t))
+              (set-window-point  w (point-min))
+              (set-window-hscroll w 0)
+              (set-window-start  w (point-min) t))))))))
 
 (defun gikopoi--map-fit-windows ()
-  "Resize every window showing the map to fit the map, up to half the frame."
-  (dolist (w (get-buffer-window-list gikopoi-map-buffer nil t))
-    (with-selected-window w
-      (fit-window-to-buffer w (max 8 (/ (frame-height) 2))))))
+  "Fit ASCII-map windows to their text.
+Graphical windows are left as the user/`display-buffer' sized them — the image
+is rendered to fill that size (see `gikopoi--map-view-size'), so resizing the
+window resizes the room view rather than the other way around."
+  (when (and (buffer-live-p gikopoi-map-buffer) (not (gikopoi--map-graphical-p)))
+    (setq gikopoi--map-fitted-room
+          (and gikopoi-current-room (gikopoi-room-id gikopoi-current-room)))
+    (run-at-time
+     0 nil
+     (lambda ()
+       (when (buffer-live-p gikopoi-map-buffer)
+         (dolist (w (get-buffer-window-list gikopoi-map-buffer nil t))
+           (let ((window-min-height 4))
+             (fit-window-to-buffer w (- (frame-height) 4) 8))))))))
 
 (defun gikopoi--refresh-map-buffer ()
-  "Redraw the room map (and refit its window) if it is currently displayed."
+  "Redraw the map if displayed; refit only the ASCII window when the room changed."
   (when (and (buffer-live-p gikopoi-map-buffer)
              (get-buffer-window gikopoi-map-buffer t))
     (gikopoi--map-draw)
-    (gikopoi--map-fit-windows)))
+    (unless (or (gikopoi--map-graphical-p)
+                (equal gikopoi--map-fitted-room
+                       (and gikopoi-current-room (gikopoi-room-id gikopoi-current-room))))
+      (gikopoi--map-fit-windows))))
+
+(defun gikopoi--map-stabilize-window (win)
+  "Drop fringes/scroll bars on WIN so the image size stays steady (no jitter)."
+  (when (window-live-p win)
+    (set-window-fringes win 0 0)
+    (when (fboundp 'set-window-scroll-bars)
+      (set-window-scroll-bars win 0 nil 0 nil))))
+
+(defun gikopoi--map-on-size-change (&rest _)
+  "Recompute the cached view size and re-render the map after a real resize."
+  (when (and (gikopoi--map-graphical-p)
+             (buffer-live-p gikopoi-map-buffer)
+             (get-buffer-window gikopoi-map-buffer t))
+    (let ((sz (gikopoi--map-view-size)))
+      (unless (equal sz gikopoi--map-vsize)
+        (setq gikopoi--map-vsize sz)
+        (gikopoi--map-draw)))))
+
+(add-hook 'window-size-change-functions #'gikopoi--map-on-size-change)
+
+(defun gikopoi-map-recenter ()
+  "Re-centre the graphical-map camera on you."
+  (interactive)
+  (setq gikopoi--map-cam nil)
+  (gikopoi--map-draw))
 
 (defun gikopoi-show-map ()
-  "Display a top-down map of the current room and everyone's position in it.
-The map opens in a window docked below the current one, sized to fit the map."
+  "Display the current room map and everyone's position in it.
+Opens in a properly sized window below the current one; the graphical map
+fills that window.  Resize the window to resize the view."
   (interactive)
   (unless gikopoi-current-room
     (user-error "Gikopoi: not in a room"))
   (unless (buffer-live-p gikopoi-map-buffer)
     (setq gikopoi-map-buffer (get-buffer-create "*Gikopoi Map*"))
     (with-current-buffer gikopoi-map-buffer (gikopoi-map-mode)))
-  (gikopoi--map-draw)                    ; draw first so the window can fit it
+  ;; Show first so the window exists, then lock its size and draw to fill it.
   (display-buffer
    gikopoi-map-buffer
    '((display-buffer-reuse-window display-buffer-below-selected)
-     (window-height . fit-window-to-buffer)
+     (window-height . 0.6)
      (preserve-size . (nil . t))))
+  (let ((win (get-buffer-window gikopoi-map-buffer t)))
+    (gikopoi--map-stabilize-window win)
+    (setq gikopoi--map-vsize (gikopoi--map-view-size)))
+  (gikopoi--map-draw)
   (gikopoi--map-fit-windows))
 
 
