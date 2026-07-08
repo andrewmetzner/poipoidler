@@ -1,7 +1,7 @@
 ;;; gikopoipoi.el --- Gikopoipoi.net chat client -*- lexical-binding: t; coding: utf-8 -*-
 
 ;; Based on gikomacs by gyudon_addict◆hawaiiZtQ6
-;; https://github.com/andrewmetzner/gikomacs
+;; https://github.com/andrewmetzner/poipoidler
 ;;
 ;; Package-Requires: ((emacs "28.1") (websocket "1.15"))
 ;; Keywords: games, chat, client
