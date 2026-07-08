@@ -146,16 +146,42 @@ Matches the algorithm used by the poipoi browser extension."
       (string-to-number (substring id -3) 16)
     0))
 
-(defvar gikopoi-current-server  nil "Hostname of the active connection.")
-(defvar gikopoi-current-user-id nil "Public user ID assigned by the server.")
-(defvar gikopoi-current-private-user-id nil "Private user ID (used in WS header).")
-(defvar gikopoi-current-user    nil "The local `gikopoi-user' object.")
-(defvar gikopoi-current-room    nil "The active `gikopoi-room' object.")
-(defvar gikopoi-current-room-loading-p nil "Non-nil while a room transition is in progress.")
-(defvar gikopoi-rooms           nil "All `gikopoi-room' objects seen this session.")
-(defvar gikopoi--server-user-count   0   "Last user count from server-stats.")
-(defvar gikopoi--server-stream-count 0   "Last stream count from server-stats.")
-(defvar gikopoi--stats-mode-line     ""  "Mode-line fragment updated by server-stats.")
+;; All connection-level state lives in one `gikopoi-session' object (the
+;; singleton `gikopoi--session') so the whole connection can be inspected and
+;; reasoned about as a unit.  The socket, reconnect, and stats fields are
+;; declared here too even though they belong to later sections, keeping the
+;; session model in one place.
+(cl-defstruct (gikopoi-session (:constructor gikopoi--make-session)
+                               (:conc-name gikopoi-ss-))
+  "State of the active connection to a Gikopoi server.
+Identity / room:
+  SERVER            hostname of the active connection
+  USER-ID           public user id assigned by the server
+  PRIVATE-USER-ID   private user id (sent in the WS header)
+  USER              the local `gikopoi-user' object
+  ROOM              the active `gikopoi-room' object
+  ROOM-LOADING-P    non-nil while a room transition is in progress
+  ROOMS             all `gikopoi-room' objects seen this session
+Server stats (from server-stats):
+  USER-COUNT STREAM-COUNT STATS-MODE-LINE
+WebSocket / Socket.IO:
+  SOCKET SOCKET-INTERVAL SOCKET-TOLERANCE SOCKET-PING-TIMER SOCKET-TIMEOUT
+  RECONNECTING-P
+Reconnect machinery:
+  DELIBERATELY-QUIT non-nil when the user asked to disconnect
+  RECONNECT-TIMER   pending exponential-back-off reconnect timer
+  RECONNECT-DELAY   current back-off delay in seconds
+  LAST-ARGS         args from the last `gikopoi' call, reused on reconnect
+  PERIODIC-RECONNECT-TIMER  the every-N-minutes reconnect timer"
+  server user-id private-user-id user room room-loading-p rooms
+  (user-count 0) (stream-count 0) (stats-mode-line "")
+  socket socket-interval (socket-tolerance 1) socket-ping-timer socket-timeout
+  reconnecting-p
+  deliberately-quit reconnect-timer (reconnect-delay 5) last-args
+  periodic-reconnect-timer)
+
+(defvar gikopoi--session (gikopoi--make-session)
+  "The singleton `gikopoi-session' holding all connection-level state.")
 
 
 ;;; ── 4. Filesystem Defaults ────────────────────────────────────────────────
@@ -258,37 +284,25 @@ Matches the algorithm used by the poipoi browser extension."
 ;;;  40  – socket.io connect ack
 ;;;  42  – socket.io event  → ["eventName", arg1, arg2, …]
 
-(defvar gikopoi-socket           nil)
-(defvar gikopoi-socket-interval  nil)
-(defvar gikopoi-socket-tolerance 1)
-(defvar gikopoi-socket-ping-timer nil)
-(defvar gikopoi-socket-timeout   nil)
-(defvar gikopoi-reconnecting-p   nil)
-
-;;; Reconnect machinery
-
-(defvar gikopoi--deliberately-quit    nil "Non-nil when the user asked to disconnect.")
-(defvar gikopoi--reconnect-timer      nil)
-(defvar gikopoi--reconnect-delay      5   "Current delay for the next reconnect attempt.")
-(defvar gikopoi--last-args            nil "Args from the last `gikopoi' call; used by reconnect.")
+;; Socket and reconnect state live in `gikopoi--session' (see section 3).
 
 (defun gikopoi--schedule-reconnect (delay)
   "Schedule a full re-login + reconnect in DELAY seconds, with exponential back-off."
-  (when (timerp gikopoi--reconnect-timer)
-    (cancel-timer gikopoi--reconnect-timer))
+  (when (timerp (gikopoi-ss-reconnect-timer gikopoi--session))
+    (cancel-timer (gikopoi-ss-reconnect-timer gikopoi--session)))
   (when (buffer-live-p gikopoi-message-buffer)
     (gikopoi-with-message-buffer
       (insert (format "%s* disconnected — retrying in %ds\n"
                       (format-time-string gikopoi-msg-time-format) delay))))
-  (setq gikopoi--reconnect-delay delay
-        gikopoi--reconnect-timer
+  (setf (gikopoi-ss-reconnect-delay gikopoi--session) delay
+        (gikopoi-ss-reconnect-timer gikopoi--session)
         (run-at-time delay nil
                      (lambda ()
                        (condition-case err
                            (gikopoi-reconnect)
                          (error
                           (gikopoi--schedule-reconnect
-                           (min (* gikopoi--reconnect-delay 2)
+                           (min (* (gikopoi-ss-reconnect-delay gikopoi--session) 2)
                                 gikopoi-reconnect-max-delay))))))))
 
 ;;; WebSocket open / close
@@ -299,33 +313,33 @@ Matches the algorithm used by the poipoi browser extension."
     (format "ws://%s:%d/socket.io/?EIO=4&transport=websocket" server port)))
 
 (defun gikopoi-socket-open (server port pid)
-  (setq gikopoi-socket
+  (setf (gikopoi-ss-socket gikopoi--session)
         (websocket-open
          (gikopoi--ws-url server port)
          :custom-header-alist `((private-user-id . ,pid)
                                 (perMessageDeflate . false))
-         :on-open    (lambda (_sock) (websocket-send-text gikopoi-socket "40"))
+         :on-open    (lambda (_sock) (websocket-send-text (gikopoi-ss-socket gikopoi--session) "40"))
          :on-close   (lambda (_sock)
-                       (when (timerp gikopoi-socket-ping-timer)
-                         (cancel-timer gikopoi-socket-ping-timer))
+                       (when (timerp (gikopoi-ss-socket-ping-timer gikopoi--session))
+                         (cancel-timer (gikopoi-ss-socket-ping-timer gikopoi--session)))
                        (when (and gikopoi-auto-reconnect
-                                  (not gikopoi--deliberately-quit))
+                                  (not (gikopoi-ss-deliberately-quit gikopoi--session)))
                          (gikopoi--schedule-reconnect 5)))
          :on-message #'gikopoi--ws-message-handler))
-  (setf (websocket-client-data gikopoi-socket) (list server port pid))
-  gikopoi-socket)
+  (setf (websocket-client-data (gikopoi-ss-socket gikopoi--session)) (list server port pid))
+  (gikopoi-ss-socket gikopoi--session))
 
 (defun gikopoi-socket-close ()
-  (when (and gikopoi-socket (websocket-openp gikopoi-socket))
-    (websocket-close gikopoi-socket))
-  (when (timerp gikopoi-socket-ping-timer)
-    (cancel-timer gikopoi-socket-ping-timer)))
+  (when (and (gikopoi-ss-socket gikopoi--session) (websocket-openp (gikopoi-ss-socket gikopoi--session)))
+    (websocket-close (gikopoi-ss-socket gikopoi--session)))
+  (when (timerp (gikopoi-ss-socket-ping-timer gikopoi--session))
+    (cancel-timer (gikopoi-ss-socket-ping-timer gikopoi--session))))
 
 (defun gikopoi-socket-emit (event &rest args)
   "Send EVENT with ARGS as a socket.io packet to the server."
-  (if (and gikopoi-socket (websocket-openp gikopoi-socket))
+  (if (and (gikopoi-ss-socket gikopoi--session) (websocket-openp (gikopoi-ss-socket gikopoi--session)))
       (websocket-send-text
-       gikopoi-socket
+       (gikopoi-ss-socket gikopoi--session)
        (concat "42" (encode-coding-string
                      (json-encode (apply #'vector event args)) 'utf-8)))
     (user-error "Gikopoi: not connected")))
@@ -348,9 +362,9 @@ Matches the algorithm used by the poipoi browser extension."
 
 (defun gikopoi-room-list-request ()
   "Fetch the room list via REST API (the old user-room-list WS event is no longer served)."
-  (let* ((server (or gikopoi-current-server "gikopoipoi.net"))
-         (area   (or (nth 2 gikopoi--last-args) gikopoi-default-area "for"))
-         (pid    gikopoi-current-private-user-id)
+  (let* ((server (or (gikopoi-ss-server gikopoi--session) "gikopoipoi.net"))
+         (area   (or (nth 2 (gikopoi-ss-last-args gikopoi--session)) gikopoi-default-area "for"))
+         (pid    (gikopoi-ss-private-user-id gikopoi--session))
          (url    (format "https://%s/api/areas/%s/rooms" server area))
          (url-request-method "GET")
          (url-request-extra-headers
@@ -390,17 +404,17 @@ Matches the algorithm used by the poipoi browser extension."
           (pcase id
             (0  ; EIO handshake
              (let-alist payload
-               (setq gikopoi-socket-interval (/ .pingInterval 1000)
-                     gikopoi-socket-timeout  (/ .pingTimeout  1000))))
+               (setf (gikopoi-ss-socket-interval gikopoi--session) (/ .pingInterval 1000)
+                     (gikopoi-ss-socket-timeout gikopoi--session)  (/ .pingTimeout  1000))))
             (2  ; ping – reset watchdog timer, send pong
-             (when (timerp gikopoi-socket-ping-timer)
-               (cancel-timer gikopoi-socket-ping-timer))
-             (websocket-send-text gikopoi-socket "3")
-             (setq gikopoi-socket-ping-timer
-                   (run-at-time (+ gikopoi-socket-interval gikopoi-socket-tolerance)
+             (when (timerp (gikopoi-ss-socket-ping-timer gikopoi--session))
+               (cancel-timer (gikopoi-ss-socket-ping-timer gikopoi--session)))
+             (websocket-send-text (gikopoi-ss-socket gikopoi--session) "3")
+             (setf (gikopoi-ss-socket-ping-timer gikopoi--session)
+                   (run-at-time (+ (gikopoi-ss-socket-interval gikopoi--session) (gikopoi-ss-socket-tolerance gikopoi--session))
                                 nil
                                 (lambda ()
-                                  (unless gikopoi--deliberately-quit
+                                  (unless (gikopoi-ss-deliberately-quit gikopoi--session)
                                     (gikopoi--schedule-reconnect 5))))))
             (40 nil) ; socket.io connect ack
             (42 (when (vectorp payload) (gikopoi--dispatch-event payload)))
@@ -482,8 +496,8 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
   (setf (slot-value u 'raw-name) (or (slot-value u 'name) ""))
   (setf (gikopoi-user-name u) (slot-value u 'raw-name))
   ;; Track ourselves
-  (when (equal gikopoi-current-user-id (slot-value u 'id))
-    (setq gikopoi-current-user u)))
+  (when (equal (gikopoi-ss-user-id gikopoi--session) (slot-value u 'id))
+    (setf (gikopoi-ss-user gikopoi--session) u)))
 
 (cl-defmethod (setf gikopoi-user-name) (name (u gikopoi-user))
   (setf (slot-value u 'name)
@@ -499,8 +513,8 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
   "Toggle anonymous user numbering and refresh all names in the current room."
   (interactive)
   (setq gikopoi-anon-numbers (not gikopoi-anon-numbers))
-  (when gikopoi-current-room
-    (dolist (u (gikopoi-room-users gikopoi-current-room))
+  (when (gikopoi-ss-room gikopoi--session)
+    (dolist (u (gikopoi-room-users (gikopoi-ss-room gikopoi--session)))
       (setf (gikopoi-user-name u) (gikopoi-user-raw-name u))))
   (message "Gikopoi: anon numbers %s" (if gikopoi-anon-numbers "on" "off")))
 
@@ -521,15 +535,15 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
                    :last-movement   .lastMovement)))
 
 (defun gikopoi-user-by-id (id)
-  (cl-find id (gikopoi-room-users gikopoi-current-room)
+  (cl-find id (gikopoi-room-users (gikopoi-ss-room gikopoi--session))
            :test #'equal :key #'gikopoi-user-id))
 
 (defun gikopoi-user-by-name (name)
-  (cl-find name (gikopoi-room-users gikopoi-current-room)
+  (cl-find name (gikopoi-room-users (gikopoi-ss-room gikopoi--session))
            :test #'string= :key #'gikopoi-user-raw-name))
 
 (defun gikopoi-user-names ()
-  (mapcar #'gikopoi-user-name (gikopoi-room-users gikopoi-current-room)))
+  (mapcar #'gikopoi-user-name (gikopoi-room-users (gikopoi-ss-room gikopoi--session))))
 
 ;;; — Room ——————————————————————————————————————————————————————————————————
 
@@ -555,14 +569,14 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
 
 (defun gikopoi--get-or-create-room (id group assets users)
   "Return existing room with ID or create a fresh one."
-  (let ((existing (cl-find id gikopoi-rooms :test #'equal :key #'gikopoi-room-id)))
+  (let ((existing (cl-find id (gikopoi-ss-rooms gikopoi--session) :test #'equal :key #'gikopoi-room-id)))
     (if existing
         (progn
           (shared-initialize existing (list :id id :group group :assets assets :users users))
           existing)
       (let ((r (make-instance 'gikopoi-room
                               :id id :group group :assets assets :users users)))
-        (push r gikopoi-rooms)
+        (push r (gikopoi-ss-rooms gikopoi--session))
         r))))
 
 
@@ -573,7 +587,7 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
 (cl-defmethod gikopoi-user-insert-message ((u gikopoi-user) text)
   (unless (gikopoi-user-ignored-p u)
     (let ((line (concat (format-time-string gikopoi-msg-time-format) (or text ""))))
-      (if (eq u gikopoi-current-user)
+      (if (eq u (gikopoi-ss-user gikopoi--session))
           (gikopoi-clear-mentions)
         (when (setq gikopoi-message-matched-p
                     (string-match gikopoi-mention-regexp line))
@@ -596,7 +610,7 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
       (gikopoi-user-insert-message u formatted)
       (unless silentp
         (gikopoi-play-sound
-         (if (and gikopoi-message-matched-p (not (eq u gikopoi-current-user)))
+         (if (and gikopoi-message-matched-p (not (eq u (gikopoi-ss-user gikopoi--session))))
              gikopoi-mention-sound
            gikopoi-message-sound))))))
 
@@ -633,11 +647,11 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
 ;;; Room events
 
 (gikopoi-defevent server-update-current-room-state ((currentRoom connectedUsers streams))
-  (let ((prev-id (and gikopoi-current-room
-                      (gikopoi-room-id gikopoi-current-room)))
+  (let ((prev-id (and (gikopoi-ss-room gikopoi--session)
+                      (gikopoi-room-id (gikopoi-ss-room gikopoi--session))))
         (new-id  (alist-get 'id currentRoom)))
-    (setq gikopoi-current-room-loading-p t
-          gikopoi-current-room
+    (setf (gikopoi-ss-room-loading-p gikopoi--session) t
+          (gikopoi-ss-room gikopoi--session)
           (gikopoi--get-or-create-room
            new-id
            (alist-get 'group currentRoom)
@@ -654,27 +668,27 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
                         new-id)))
       (force-mode-line-update t)
       (gikopoi--refresh-user-list-buffer))
-    (unless gikopoi-reconnecting-p
-      (dolist (u (gikopoi-room-users gikopoi-current-room))
+    (unless (gikopoi-ss-reconnecting-p gikopoi--session)
+      (dolist (u (gikopoi-room-users (gikopoi-ss-room gikopoi--session)))
         (unless (gikopoi-user-ignored-p u)
           (when-let ((msg (gikopoi-user-last-message u)))
             (gikopoi-user-msg u msg t)))))
     (gikopoi--map-anim-reset)
     ;; Auto-open the map on first connect (deferred so the room settles first).
     (when (and gikopoi-map-auto-open (null prev-id)
-               (not gikopoi-reconnecting-p)
-               (not (buffer-live-p gikopoi-map-buffer)))
+               (not (gikopoi-ss-reconnecting-p gikopoi--session))
+               (not (buffer-live-p (gikopoi-mv-buffer gikopoi--map))))
       (run-at-time 0.5 nil (lambda ()
-                             (when gikopoi-current-room (gikopoi-show-map)))))
+                             (when (gikopoi-ss-room gikopoi--session) (gikopoi-show-map)))))
     (gikopoi--refresh-map-buffer)))
 
 (gikopoi-defevent server-update-current-room-streams (streams)
-  (setf (gikopoi-room-streams gikopoi-current-room) streams)
+  (setf (gikopoi-room-streams (gikopoi-ss-room gikopoi--session)) streams)
   (force-mode-line-update))
 
 (gikopoi-defevent server-user-joined-room (user &optional from reconnectingp)
   (let ((u (gikopoi-make-user user)))
-    (gikopoi-room-add-user gikopoi-current-room u)
+    (gikopoi-room-add-user (gikopoi-ss-room gikopoi--session) u)
     (gikopoi-user-join u from reconnectingp)
     (gikopoi--refresh-user-list-buffer)
     (gikopoi--refresh-map-buffer)))
@@ -682,7 +696,7 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
 (gikopoi-defevent server-user-left-room (id &optional destination)
   (when-let ((u (gikopoi-user-by-id id)))
     (gikopoi-user-leave u destination)
-    (gikopoi-room-remove-user gikopoi-current-room u)
+    (gikopoi-room-remove-user (gikopoi-ss-room gikopoi--session) u)
     (gikopoi--refresh-user-list-buffer)
     (gikopoi--refresh-map-buffer)))
 
@@ -740,9 +754,9 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
 (gikopoi-defevent server-stats ((userCount streamCount))
   (let ((n (if (stringp userCount)   (string-to-number userCount)   (or userCount 0)))
         (s (if (stringp streamCount) (string-to-number streamCount) (or streamCount 0))))
-    (setq gikopoi--server-user-count   n
-          gikopoi--server-stream-count s
-          gikopoi--stats-mode-line
+    (setf (gikopoi-ss-user-count gikopoi--session)   n
+          (gikopoi-ss-stream-count gikopoi--session) s
+          (gikopoi-ss-stats-mode-line gikopoi--session)
           (format " [%su%s]" n (if (> s 0) (format " %ss" s) "")))
     (force-mode-line-update)))
 
@@ -822,7 +836,7 @@ Each entry is (ROOM-ID [NAME AREA COUNT STREAMERS]).")
 
 (defun gikopoi--busiest-room-id ()
   "Return the room ID with the most users, excluding the current room."
-  (let ((cur (and gikopoi-current-room (gikopoi-room-id gikopoi-current-room)))
+  (let ((cur (and (gikopoi-ss-room gikopoi--session) (gikopoi-room-id (gikopoi-ss-room gikopoi--session))))
         best-id best-n)
     (maphash (lambda (id n)
                (when (and (not (equal id cur))
@@ -846,7 +860,7 @@ Each entry is (ROOM-ID [NAME AREA COUNT STREAMERS]).")
   (cond
    (gikopoi--join-busiest-p
     (setq gikopoi--join-busiest-p nil)
-    (let* ((cur     (and gikopoi-current-room (gikopoi-room-id gikopoi-current-room)))
+    (let* ((cur     (and (gikopoi-ss-room gikopoi--session) (gikopoi-room-id (gikopoi-ss-room gikopoi--session))))
            (overall (gikopoi--overall-busiest-room-id)))
       (if (equal cur overall)
           (gikopoi-with-message-buffer
@@ -1020,7 +1034,7 @@ Requests a fresh room list from the server first."
                           (concat (if (gikopoi-user-active-p  u) "" "z")
                                   (if (gikopoi-user-ignored-p u) "I" ""))
                           (or (gikopoi-user-last-message u) ""))))
-          (gikopoi-room-users gikopoi-current-room)))
+          (gikopoi-room-users (gikopoi-ss-room gikopoi--session))))
 
 (defun gikopoi--refresh-user-list-buffer ()
   (when (buffer-live-p gikopoi-user-list-buffer)
@@ -1057,8 +1071,6 @@ Requests a fresh room list from the server first."
 ;;; system puts the origin at the front-left with y increasing toward the back,
 ;;; so rows are rendered highest-y first (back of the room at the top).
 
-(defvar gikopoi-map-buffer nil)
-
 (defcustom gikopoi-map-glyphs
   '((floor . "·") (blocked . "▓") (sit . "▒") (door . "+"))
   "Glyphs for the static tiles drawn in the room map."
@@ -1090,7 +1102,7 @@ entry (e.g. `floor', `blocked') get no colour block."
   :type '(alist :key-type symbol :value-type color))
 
 (defun gikopoi--room-assets ()
-  (and gikopoi-current-room (gikopoi-room-assets gikopoi-current-room)))
+  (and (gikopoi-ss-room gikopoi--session) (gikopoi-room-assets (gikopoi-ss-room gikopoi--session))))
 
 (defun gikopoi--map-glyph (kind) (alist-get kind gikopoi-map-glyphs))
 
@@ -1120,14 +1132,14 @@ entry (e.g. `floor', `blocked') get no colour block."
 (defun gikopoi--map-user-set ()
   "Hash (X . Y) → list of users standing on that tile."
   (let ((h (make-hash-table :test 'equal)))
-    (dolist (u (gikopoi-room-users gikopoi-current-room) h)
+    (dolist (u (gikopoi-room-users (gikopoi-ss-room gikopoi--session)) h)
       (when-let ((pos (gikopoi-user-position u)))
         (push u (gethash (cons (car pos) (cdr pos)) h))))))
 
 (defun gikopoi--map-user-glyph (users)
   "Return the propertized avatar glyph for the USERS on a single tile."
-  (let* ((you   (memq gikopoi-current-user users))
-         (u     (if you gikopoi-current-user (car users)))
+  (let* ((you   (memq (gikopoi-ss-user gikopoi--session) users))
+         (u     (if you (gikopoi-ss-user gikopoi--session) (car users)))
          (names (mapconcat #'gikopoi-user-raw-name users ", ")))
     (cond
      (you (propertize (gikopoi--map-arrow (gikopoi-user-direction u))
@@ -1206,13 +1218,13 @@ a door or warp — stays visible even with people stacked on it."
              (doors   (gikopoi--map-door-set))
              (users   (gikopoi--map-user-set)))
         (insert (propertize (format "%s  (%d×%d)\n"
-                                     (gikopoi-room-id gikopoi-current-room) w h)
+                                     (gikopoi-room-id (gikopoi-ss-room gikopoi--session)) w h)
                             'face 'bold))
-        (when-let ((p (and gikopoi-current-user
-                           (gikopoi-user-position gikopoi-current-user))))
+        (when-let ((p (and (gikopoi-ss-user gikopoi--session)
+                           (gikopoi-user-position (gikopoi-ss-user gikopoi--session)))))
           (insert (format "you: (%s,%s) facing %s\n"
                           (car p) (cdr p)
-                          (gikopoi-user-direction gikopoi-current-user))))
+                          (gikopoi-user-direction (gikopoi-ss-user gikopoi--session)))))
         (insert "\n")
         (cl-loop for y from (1- h) downto 0 do
                  (cl-loop for x from 0 below w do
@@ -1228,9 +1240,18 @@ a door or warp — stays visible even with people stacked on it."
 ;;; then shows it as an image.  Assets are downloaded on demand from the
 ;;; gikopoi2 repo and cached under `gikopoi-site-directory'.
 
-(defcustom gikopoi-map-graphical (image-type-available-p 'svg)
-  "When non-nil, draw the room map as composited graphics instead of ASCII."
-  :group 'gikopoi :type 'boolean)
+(defcustom gikopoi-map-renderer 'auto
+  "Which renderer the room map starts in.
+  `auto'     – graphics on a GUI with SVG support, otherwise ASCII (default)
+  `graphics' – always start in the composited-graphics map
+  `ascii'    – always start in the ASCII grid map
+Toggle at runtime with `gikopoi-map-toggle-graphics' (\\`t' in the map); this
+setting only chooses the initial mode.  On a text terminal the map always
+falls back to ASCII regardless of this setting."
+  :group 'gikopoi
+  :type '(choice (const :tag "Auto (graphics if supported)" auto)
+                 (const :tag "Always graphics" graphics)
+                 (const :tag "Always ASCII" ascii)))
 
 (defcustom gikopoi-map-auto-open t
   "When non-nil, open the room map automatically on connecting to a server."
@@ -1241,9 +1262,10 @@ a door or warp — stays visible even with people stacked on it."
   "Base URL for downloading room and character SVG assets."
   :group 'gikopoi :type 'string)
 
-(defcustom gikopoi-map-scale 1.0
-  "Zoom level of the graphical map: higher shows less room, bigger.
-Adjusted with `gikopoi-map-zoom-in'/`-out' (\\`+' / \\`-' in the map)."
+(defcustom gikopoi-map-default-zoom 1.0
+  "Initial zoom level of the graphical map: higher shows less room, bigger.
+The live zoom is the `zoom' slot of `gikopoi--map'; adjust it at runtime with
+`gikopoi-map-zoom-in'/`-out' (\\`+' / \\`-' in the map)."
   :group 'gikopoi :type 'number)
 
 (defcustom gikopoi-map-view-width 760
@@ -1282,13 +1304,37 @@ A bubble stays up as long as the user keeps that message active."
   "Frames per second for graphical-map walk animation."
   :group 'gikopoi :type 'number)
 
-(defvar gikopoi--asset-datauri-cache (make-hash-table :test 'equal))
-(defvar gikopoi--asset-dims-cache    (make-hash-table :test 'equal))
-(defvar-local gikopoi--map-current-image nil "Image object last drawn in the map buffer.")
-(defvar gikopoi--map-last-size nil "Last (W . H) px the graphical map was rendered at.")
-(defvar gikopoi--map-vsize nil "Cached (W . H) px of the map view; stable between resizes.")
-(defvar gikopoi--map-cam nil "Remembered camera origin (VX . VY) for the current room.")
-(defvar gikopoi--map-cam-room nil "Room id the remembered camera belongs to.")
+;; Asset caches are genuinely module-global (shared across every view and room),
+;; so they stay as plain variables rather than moving into the map-view object.
+(defvar gikopoi--asset-datauri-cache (make-hash-table :test 'equal)
+  "Cache of asset relpath -> data: URI string.")
+(defvar gikopoi--asset-dims-cache    (make-hash-table :test 'equal)
+  "Cache of asset relpath -> (WIDTH . HEIGHT) in pixels.")
+
+(cl-defstruct (gikopoi-map-view (:constructor gikopoi--make-map-view)
+                                (:conc-name gikopoi-mv-))
+  "Bundled state for the room-map view.
+Groups what used to be scattered `gikopoi-map-*'/`gikopoi--map-*' globals into
+one inspectable, resettable object — the singleton `gikopoi--map':
+  BUFFER       the *Gikopoi Map* buffer, or nil
+  GRAPHICAL    non-nil when drawing composited graphics rather than ASCII
+  ZOOM         current zoom factor (1.0 = 100%)
+  VSIZE        cached (W . H) px of the view, stable between real resizes
+  FITTED-ROOM  room id the ASCII window was last fitted to
+  ANIM         user-id -> walk-animation plist (:px :py :walking :phase)
+  ANIM-TIMER   the running animation timer, or nil"
+  buffer
+  (graphical (pcase gikopoi-map-renderer
+               ('graphics t) ('ascii nil)
+               (_ (image-type-available-p 'svg))))
+  (zoom gikopoi-map-default-zoom)
+  vsize
+  fitted-room
+  (anim (make-hash-table :test 'equal))
+  anim-timer)
+
+(defvar gikopoi--map (gikopoi--make-map-view)
+  "The singleton `gikopoi-map-view' holding all room-map view state.")
 
 (defun gikopoi--map-camera (cw ch vw vh ccx ccy _rid)
   "Return camera origin (VX . VY) that simply follows the target (CCX . CCY).
@@ -1302,19 +1348,13 @@ Rooms smaller than the view are centred and stay put."
   "Return the target (WIDTH . HEIGHT) in pixels for the map image.
 Fills the map window when it is displayed, so the room view is responsive;
 falls back to `gikopoi-map-view-width'/`-height' before the window exists."
-  (let ((win (and (buffer-live-p gikopoi-map-buffer)
-                  (get-buffer-window gikopoi-map-buffer t))))
+  (let ((win (and (buffer-live-p (gikopoi-mv-buffer gikopoi--map))
+                  (get-buffer-window (gikopoi-mv-buffer gikopoi--map) t))))
     (if (and win (fboundp 'window-body-width))
         (cons (max 200 (- (window-body-width  win t) 6))
               (max 150 (- (window-body-height win t) 6)))
       (cons gikopoi-map-view-width gikopoi-map-view-height))))
 
-(defvar gikopoi--map-anim (make-hash-table :test 'equal)
-  "Per-user walk animation state: user-id -> plist (:px :py :walking :phase).
-:px/:py are the sprite's current feet position in scaled pixels.")
-(defvar gikopoi--map-anim-timer nil "Active animation timer, or nil.")
-(defvar gikopoi--map-fitted-room nil
-  "Room id the map window was last fitted to; avoids resizing on every move.")
 
 (defun gikopoi--n (x) "Format number X for an SVG attribute." (format "%g" x))
 
@@ -1518,9 +1558,9 @@ When WALKING, alternate the two walk frames according to PHASE."
 (defun gikopoi--current-user-feet ()
   "Return the local user's feet position (CX . FY) in background pixels, or nil.
 Uses the animated position while walking so the camera follows smoothly."
-  (when-let ((u gikopoi-current-user)
+  (when-let ((u (gikopoi-ss-user gikopoi--session))
              (pos (gikopoi-user-position u)))
-    (let ((e (gethash (gikopoi-user-id u) gikopoi--map-anim)))
+    (let ((e (gethash (gikopoi-user-id u) (gikopoi-mv-anim gikopoi--map))))
       (if (and e (plist-get e :walking))
           (cons (plist-get e :px) (plist-get e :py))
         (gikopoi--tile-feet (car pos) (cdr pos))))))
@@ -1537,34 +1577,34 @@ If CONTENT is smaller than REGION, centre it (result may be negative)."
   (let* ((assets (gikopoi--room-assets))
          (bw (or (alist-get 'blockWidth assets) gikopoi--map-block-w)))
     (* bw 0.0015
-       (if (equal (gikopoi-room-id gikopoi-current-room) "long_st") 2 1))))
+       (if (equal (gikopoi-room-id (gikopoi-ss-room gikopoi--session)) "long_st") 2 1))))
 
 (defun gikopoi--map-anim-stop ()
-  (when gikopoi--map-anim-timer
-    (cancel-timer gikopoi--map-anim-timer)
-    (setq gikopoi--map-anim-timer nil)))
+  (when (gikopoi-mv-anim-timer gikopoi--map)
+    (cancel-timer (gikopoi-mv-anim-timer gikopoi--map))
+    (setf (gikopoi-mv-anim-timer gikopoi--map) nil)))
 
 (defun gikopoi--map-anim-reset ()
   "Clear all walk-animation state and stop the timer (e.g. on room change)."
-  (clrhash gikopoi--map-anim)
+  (clrhash (gikopoi-mv-anim gikopoi--map))
   (gikopoi--map-anim-stop))
 
 (defun gikopoi--map-anim-visible-p ()
-  (and gikopoi-map-graphical gikopoi-current-room
-       (buffer-live-p gikopoi-map-buffer)
-       (get-buffer-window gikopoi-map-buffer t)))
+  (and (gikopoi-mv-graphical gikopoi--map) (gikopoi-ss-room gikopoi--session)
+       (buffer-live-p (gikopoi-mv-buffer gikopoi--map))
+       (get-buffer-window (gikopoi-mv-buffer gikopoi--map) t)))
 
 (defun gikopoi--map-start-walk (id old-pos)
   "Begin animating user ID walking away from OLD-POS (its previous tile)."
-  (let* ((e    (gethash id gikopoi--map-anim))
+  (let* ((e    (gethash id (gikopoi-mv-anim gikopoi--map)))
          (seed (if (and e (plist-get e :walking))
                    (cons (plist-get e :px) (plist-get e :py))   ; continue mid-walk
                  (gikopoi--tile-feet (car old-pos) (cdr old-pos)))))
     (puthash id (list :px (car seed) :py (cdr seed) :walking t
                       :phase (if e (plist-get e :phase) 0))
-             gikopoi--map-anim))
-  (unless gikopoi--map-anim-timer
-    (setq gikopoi--map-anim-timer
+             (gikopoi-mv-anim gikopoi--map)))
+  (unless (gikopoi-mv-anim-timer gikopoi--map)
+    (setf (gikopoi-mv-anim-timer gikopoi--map)
           (run-at-time 0 (/ 1.0 (max 1 gikopoi-map-anim-fps))
                        #'gikopoi--map-anim-tick))))
 
@@ -1580,7 +1620,7 @@ If CONTENT is smaller than REGION, centre it (result may be negative)."
              (when (plist-get e :walking)
                (let ((u (gikopoi-user-by-id id)))
                  (if (not u)
-                     (remhash id gikopoi--map-anim)
+                     (remhash id (gikopoi-mv-anim gikopoi--map))
                    (let* ((pos  (gikopoi-user-position u))
                           (feet (gikopoi--tile-feet (car pos) (cdr pos)))
                           (px   (plist-get e :px)) (py (plist-get e :py))
@@ -1594,8 +1634,8 @@ If CONTENT is smaller than REGION, centre it (result may be negative)."
                              e (plist-put e :py (+ py (* step (/ dy dist))))
                              e (plist-put e :phase (1+ (plist-get e :phase))))
                        (setq moving t))
-                     (puthash id e gikopoi--map-anim))))))
-           gikopoi--map-anim)
+                     (puthash id e (gikopoi-mv-anim gikopoi--map)))))))
+           (gikopoi-mv-anim gikopoi--map))
           (gikopoi--map-draw)
           (unless moving (gikopoi--map-anim-stop))))
     (error (gikopoi--map-anim-stop)
@@ -1741,7 +1781,7 @@ the same offsets the JS client uses."
              (bh     (or (alist-get 'blockHeight assets) gikopoi--map-block-h))
              (sy     (or (alist-get 'y (alist-get 'size assets)) 0))
              (sit    (gikopoi--coords->set (alist-get 'sit assets)))
-             (rid    (gikopoi-room-id gikopoi-current-room))
+             (rid    (gikopoi-room-id (gikopoi-ss-room gikopoi--session)))
              (items   '())
              (parts   '())
              (bubbles '()))
@@ -1764,7 +1804,7 @@ the same offsets the JS client uses."
                               :py (* (or (alist-get 'y off) 0) osc))
                         items)))))
           ;; --- gather users ---
-          (dolist (u (gikopoi-room-users gikopoi-current-room))
+          (dolist (u (gikopoi-room-users (gikopoi-ss-room gikopoi--session)))
             (unless (gikopoi-user-ignored-p u)
               (when-let ((pos (gikopoi-user-position u)))
                 (push (list :prio (+ (car pos) 1 (- sy (cdr pos)))
@@ -1792,7 +1832,7 @@ the same offsets the JS client uses."
               ('user
                (let* ((u       (plist-get it :user))
                       (x       (plist-get it :x)) (y (plist-get it :y))
-                      (e       (gethash (gikopoi-user-id u) gikopoi--map-anim))
+                      (e       (gethash (gikopoi-user-id u) (gikopoi-mv-anim gikopoi--map)))
                       (walking (and e (plist-get e :walking)))
                       (spec    (gikopoi--user-sprite-spec
                                 u sit walking (if e (plist-get e :phase) 0)))
@@ -1821,7 +1861,7 @@ the same offsets the JS client uses."
                    (let ((label (substring-no-properties (or (gikopoi-user-name u) ""))))
                      (unless (string-empty-p label)
                        (push (gikopoi--name-tag-el
-                              label cx top (eq u gikopoi-current-user))
+                              label cx top (eq u (gikopoi-ss-user gikopoi--session)))
                              parts))))
                  ;; speech bubble — persists as long as the user keeps the message
                  (when gikopoi-map-show-bubbles
@@ -1832,9 +1872,9 @@ the same offsets the JS client uses."
                              bubbles))))))))
           ;; camera: a fixed-size view (so the window keeps its size), zoomed
           ;; via the viewBox and centred on the local user in big rooms.
-          (let* ((size (or gikopoi--map-vsize (gikopoi--map-view-size)))
+          (let* ((size (or (gikopoi-mv-vsize gikopoi--map) (gikopoi--map-view-size)))
                  (sw   (car size)) (sh (cdr size))
-                 (zoom (max 0.1 gikopoi-map-scale))
+                 (zoom (max 0.1 (gikopoi-mv-zoom gikopoi--map)))
                  (vw   (/ sw zoom))
                  (vh   (/ sh zoom))
                  (feet (and gikopoi-map-follow (gikopoi--current-user-feet)))
@@ -1843,7 +1883,6 @@ the same offsets the JS client uses."
                  (cam  (gikopoi--map-camera cw ch vw vh ccx ccy rid))
                  (vx   (car cam))
                  (vy   (cdr cam)))
-            (setq gikopoi--map-last-size size)
             (concat
              (format "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"%s\" height=\"%s\" viewBox=\"%s %s %s %s\">"
                      sw sh
@@ -1889,8 +1928,8 @@ the same offsets the JS client uses."
   "Cycle your own speech-bubble position: up -> right -> down -> left."
   (interactive)
   (let* ((order '("up" "right" "down" "left"))
-         (cur   (and gikopoi-current-user
-                     (gikopoi-user-bubble-position gikopoi-current-user)))
+         (cur   (and (gikopoi-ss-user gikopoi--session)
+                     (gikopoi-user-bubble-position (gikopoi-ss-user gikopoi--session))))
          (next  (or (cadr (member cur order)) (car order))))
     (gikopoi-bubble-position next)
     (message "Bubble position: %s" next)))
@@ -1899,50 +1938,48 @@ the same offsets the JS client uses."
   "Toggle the room map between composited graphics and the ASCII grid.
 On a text terminal (no SVG image support) the map always uses ASCII."
   (interactive)
-  (if (and (not gikopoi-map-graphical) (not (image-type-available-p 'svg)))
+  (if (and (not (gikopoi-mv-graphical gikopoi--map)) (not (image-type-available-p 'svg)))
       (message "Gikopoi: graphical map needs a GUI with SVG support; using ASCII")
-    (setq gikopoi-map-graphical (not gikopoi-map-graphical))
+    (setf (gikopoi-mv-graphical gikopoi--map) (not (gikopoi-mv-graphical gikopoi--map)))
     (gikopoi--map-draw)
     (gikopoi--map-fit-windows)           ; graphics/ASCII differ in size
-    (message "Gikopoi map: %s" (if gikopoi-map-graphical "graphical" "ASCII"))))
+    (message "Gikopoi map: %s" (if (gikopoi-mv-graphical gikopoi--map) "graphical" "ASCII"))))
 
 (defun gikopoi-map-zoom (factor)
   "Multiply the graphical-map zoom by FACTOR and redraw.
 Zooming lets big rooms (e.g. `silo') fit the window; `0' resets to 100%."
-  (setq gikopoi-map-scale (max 0.1 (min 6.0 (* gikopoi-map-scale factor))))
+  (setf (gikopoi-mv-zoom gikopoi--map) (max 0.1 (min 6.0 (* (gikopoi-mv-zoom gikopoi--map) factor))))
   (gikopoi--map-draw)
   (gikopoi--map-fit-windows)
-  (message "Gikopoi map zoom: %d%%" (round (* 100 gikopoi-map-scale))))
+  (message "Gikopoi map zoom: %d%%" (round (* 100 (gikopoi-mv-zoom gikopoi--map)))))
 
 (defun gikopoi-map-zoom-in ()    (interactive) (gikopoi-map-zoom 1.25))
 (defun gikopoi-map-zoom-out ()   (interactive) (gikopoi-map-zoom 0.8))
 (defun gikopoi-map-zoom-reset ()
   (interactive)
-  (setq gikopoi-map-scale 1.0)
+  (setf (gikopoi-mv-zoom gikopoi--map) 1.0)
   (gikopoi--map-draw) (gikopoi--map-fit-windows)
   (message "Gikopoi map zoom: 100%%"))
 
 (defun gikopoi--map-graphical-p ()
-  (and gikopoi-map-graphical (image-type-available-p 'svg)))
+  (and (gikopoi-mv-graphical gikopoi--map) (image-type-available-p 'svg)))
 
 (defun gikopoi--map-draw ()
   "Render the room map into its buffer.
 For the graphical map the image's `display' property is swapped in place — the
 buffer is not erased and point/window-start don't move — so repeated redraws
 during movement don't make the window shake or the view jump."
-  (when (buffer-live-p gikopoi-map-buffer)
-    (with-current-buffer gikopoi-map-buffer
+  (when (buffer-live-p (gikopoi-mv-buffer gikopoi--map))
+    (with-current-buffer (gikopoi-mv-buffer gikopoi--map)
       (let ((inhibit-read-only t)
             (svg (and (gikopoi--map-graphical-p)
                       (condition-case err (gikopoi--map-svg)
                         (error (message "Gikopoi map: %s" (error-message-string err)) nil)))))
         (if (not svg)
-            (progn (setq gikopoi--map-current-image nil)
-                   (erase-buffer)
+            (progn (erase-buffer)
                    (gikopoi--render-map-ascii)
                    (goto-char (point-min)))
           (let ((img (create-image svg 'svg t :scale 1.0)))
-            (setq gikopoi--map-current-image img)
             (if (and (> (buffer-size) 0)
                      (get-text-property (point-min) 'display))
                 (put-text-property (point-min) (point-max) 'display img)
@@ -1951,7 +1988,7 @@ during movement don't make the window shake or the view jump."
             ;; Pin every map window to the top-left corner so a redraw can't
             ;; make the image jitter by scrolling to keep point in view.
             (goto-char (point-min))
-            (dolist (w (get-buffer-window-list gikopoi-map-buffer nil t))
+            (dolist (w (get-buffer-window-list (gikopoi-mv-buffer gikopoi--map) nil t))
               (set-window-point  w (point-min))
               (set-window-hscroll w 0)
               (set-window-start  w (point-min) t))))))))
@@ -1961,25 +1998,25 @@ during movement don't make the window shake or the view jump."
 Graphical windows are left as the user/`display-buffer' sized them — the image
 is rendered to fill that size (see `gikopoi--map-view-size'), so resizing the
 window resizes the room view rather than the other way around."
-  (when (and (buffer-live-p gikopoi-map-buffer) (not (gikopoi--map-graphical-p)))
-    (setq gikopoi--map-fitted-room
-          (and gikopoi-current-room (gikopoi-room-id gikopoi-current-room)))
+  (when (and (buffer-live-p (gikopoi-mv-buffer gikopoi--map)) (not (gikopoi--map-graphical-p)))
+    (setf (gikopoi-mv-fitted-room gikopoi--map)
+          (and (gikopoi-ss-room gikopoi--session) (gikopoi-room-id (gikopoi-ss-room gikopoi--session))))
     (run-at-time
      0 nil
      (lambda ()
-       (when (buffer-live-p gikopoi-map-buffer)
-         (dolist (w (get-buffer-window-list gikopoi-map-buffer nil t))
+       (when (buffer-live-p (gikopoi-mv-buffer gikopoi--map))
+         (dolist (w (get-buffer-window-list (gikopoi-mv-buffer gikopoi--map) nil t))
            (let ((window-min-height 4))
              (fit-window-to-buffer w (- (frame-height) 4) 8))))))))
 
 (defun gikopoi--refresh-map-buffer ()
   "Redraw the map if displayed; refit only the ASCII window when the room changed."
-  (when (and (buffer-live-p gikopoi-map-buffer)
-             (get-buffer-window gikopoi-map-buffer t))
+  (when (and (buffer-live-p (gikopoi-mv-buffer gikopoi--map))
+             (get-buffer-window (gikopoi-mv-buffer gikopoi--map) t))
     (gikopoi--map-draw)
     (unless (or (gikopoi--map-graphical-p)
-                (equal gikopoi--map-fitted-room
-                       (and gikopoi-current-room (gikopoi-room-id gikopoi-current-room))))
+                (equal (gikopoi-mv-fitted-room gikopoi--map)
+                       (and (gikopoi-ss-room gikopoi--session) (gikopoi-room-id (gikopoi-ss-room gikopoi--session)))))
       (gikopoi--map-fit-windows))))
 
 (defun gikopoi--map-stabilize-window (win)
@@ -1992,19 +2029,20 @@ window resizes the room view rather than the other way around."
 (defun gikopoi--map-on-size-change (&rest _)
   "Recompute the cached view size and re-render the map after a real resize."
   (when (and (gikopoi--map-graphical-p)
-             (buffer-live-p gikopoi-map-buffer)
-             (get-buffer-window gikopoi-map-buffer t))
+             (buffer-live-p (gikopoi-mv-buffer gikopoi--map))
+             (get-buffer-window (gikopoi-mv-buffer gikopoi--map) t))
     (let ((sz (gikopoi--map-view-size)))
-      (unless (equal sz gikopoi--map-vsize)
-        (setq gikopoi--map-vsize sz)
+      (unless (equal sz (gikopoi-mv-vsize gikopoi--map))
+        (setf (gikopoi-mv-vsize gikopoi--map) sz)
         (gikopoi--map-draw)))))
 
 (add-hook 'window-size-change-functions #'gikopoi--map-on-size-change)
 
 (defun gikopoi-map-recenter ()
-  "Re-centre the graphical-map camera on you."
+  "Re-centre the graphical-map camera on you.
+The camera already follows you every frame (see `gikopoi--map-camera'), so
+this just forces an immediate redraw."
   (interactive)
-  (setq gikopoi--map-cam nil)
   (gikopoi--map-draw))
 
 (defun gikopoi-show-map ()
@@ -2012,20 +2050,20 @@ window resizes the room view rather than the other way around."
 Opens in a properly sized window below the current one; the graphical map
 fills that window.  Resize the window to resize the view."
   (interactive)
-  (unless gikopoi-current-room
+  (unless (gikopoi-ss-room gikopoi--session)
     (user-error "Gikopoi: not in a room"))
-  (unless (buffer-live-p gikopoi-map-buffer)
-    (setq gikopoi-map-buffer (get-buffer-create "*Gikopoi Map*"))
-    (with-current-buffer gikopoi-map-buffer (gikopoi-map-mode)))
+  (unless (buffer-live-p (gikopoi-mv-buffer gikopoi--map))
+    (setf (gikopoi-mv-buffer gikopoi--map) (get-buffer-create "*Gikopoi Map*"))
+    (with-current-buffer (gikopoi-mv-buffer gikopoi--map) (gikopoi-map-mode)))
   ;; Show first so the window exists, then lock its size and draw to fill it.
   (display-buffer
-   gikopoi-map-buffer
+   (gikopoi-mv-buffer gikopoi--map)
    '((display-buffer-reuse-window display-buffer-below-selected)
      (window-height . 0.6)
      (preserve-size . (nil . t))))
-  (let ((win (get-buffer-window gikopoi-map-buffer t)))
+  (let ((win (get-buffer-window (gikopoi-mv-buffer gikopoi--map) t)))
     (gikopoi--map-stabilize-window win)
-    (setq gikopoi--map-vsize (gikopoi--map-view-size)))
+    (setf (gikopoi-mv-vsize gikopoi--map) (gikopoi--map-view-size)))
   (gikopoi--map-draw)
   (gikopoi--map-fit-windows))
 
@@ -2104,10 +2142,10 @@ fills that window.  Resize the window to resize the view."
 (add-to-list 'minor-mode-alist
              '(gikopoi-msg-mode
                (:eval (format ": %s@%s%s"
-                              (and gikopoi-current-room
-                                   (gikopoi-room-id gikopoi-current-room))
-                              gikopoi-current-server
-                              gikopoi--stats-mode-line))))
+                              (and (gikopoi-ss-room gikopoi--session)
+                                   (gikopoi-room-id (gikopoi-ss-room gikopoi--session)))
+                              (gikopoi-ss-server gikopoi--session)
+                              (gikopoi-ss-stats-mode-line gikopoi--session)))))
 
 (add-to-list 'minor-mode-alist
              '(gikopoi-notif-mode (:eval (gikopoi-notif-string))))
@@ -2133,16 +2171,67 @@ fills that window.  Resize the window to resize the view."
     (define-key m (kbd "RET") #'exit-minibuffer)
     m))
 
+;; TAB name completion.  We roll our own cycling completer rather than lean on
+;; `completion-in-region', because the latter drives everything through
+;; `completion-styles' — which split candidates on word/script boundaries and
+;; so mangle Japanese (and other non-space-delimited) names, and which pop a
+;; *Completions* buffer inside our recursive minibuffer.  Here the stem is the
+;; whitespace-delimited token before point, matched as a plain case-insensitive
+;; prefix (script-agnostic), and repeated TAB cycles through the candidates.
+
+(defvar gikopoi--complete-beg nil
+  "Buffer position where the token being completed begins.")
+(defvar gikopoi--complete-cands nil
+  "Candidate names for the in-progress TAB completion.")
+(defvar gikopoi--complete-index 0
+  "Index of the currently-inserted candidate in `gikopoi--complete-cands'.")
+
+(defun gikopoi--complete-candidates (stem)
+  "Room user names (unpropertized) whose prefix case-insensitively matches STEM.
+An empty STEM matches every name."
+  (let (out)
+    (dolist (n (gikopoi-user-names))
+      (let ((plain (substring-no-properties n)))
+        (when (or (string-empty-p stem) (string-prefix-p stem plain t))
+          (push plain out))))
+    (nreverse out)))
+
+(defun gikopoi--complete-insert ()
+  "Replace the token from `gikopoi--complete-beg' to point with the current
+candidate, and report the position within the candidate list."
+  (delete-region gikopoi--complete-beg (point))
+  (insert (nth gikopoi--complete-index gikopoi--complete-cands))
+  (let ((n (length gikopoi--complete-cands)))
+    (when (> n 1)
+      (minibuffer-message " [%d/%d]" (1+ gikopoi--complete-index) n))))
+
 (defun gikopoi-minibuffer-complete ()
-  "Complete the whitespace-delimited token at point against room user names.
-Uses whitespace boundaries rather than `thing-at-point' word bounds so that
-Japanese (and other non-space-delimited) names complete correctly — Emacs
-would otherwise split such names at kanji/kana/script boundaries and only
-match the trailing run."
+  "Complete the name token before point against room user names.
+Works for Japanese and other non-space-delimited scripts by matching a raw
+case-insensitive prefix rather than `thing-at-point' word bounds.  Repeated
+TAB cycles through the matching names."
   (interactive)
-  (let ((beg (save-excursion (skip-chars-backward "^ \t\n") (point)))
-        (end (save-excursion (skip-chars-forward  "^ \t\n") (point))))
-    (completion-in-region beg end (gikopoi-user-names))))
+  (if (and (eq last-command this-command) gikopoi--complete-cands)
+      ;; Repeated TAB: cycle to the next candidate, reusing the stored stem.
+      (progn
+        (setq gikopoi--complete-index
+              (mod (1+ gikopoi--complete-index)
+                   (length gikopoi--complete-cands)))
+        (gikopoi--complete-insert))
+    ;; Fresh completion: recompute the token and its candidates.
+    (let* ((end  (point))
+           (beg  (save-excursion (skip-chars-backward "^ \t\n") (point)))
+           (stem (buffer-substring-no-properties beg end))
+           (cands (gikopoi--complete-candidates stem)))
+      (cond
+       ((null cands)
+        (setq gikopoi--complete-cands nil)
+        (minibuffer-message "No matching name"))
+       (t
+        (setq gikopoi--complete-beg   beg
+              gikopoi--complete-cands cands
+              gikopoi--complete-index 0)
+        (gikopoi--complete-insert))))))
 
 (defun gikopoi-autoquote ()
   "Pre-fill the message prompt with a quote of the text at point."
@@ -2272,17 +2361,17 @@ There is no unblock in this session — reconnect to reset."
   "Apply the auto-ignore list to the current room."
   (interactive)
   (setq gikopoi-auto-ignore-names (gikopoi--load-auto-ignore))
-  (when gikopoi-current-room
-    (dolist (u (gikopoi-room-users gikopoi-current-room))
+  (when (gikopoi-ss-room gikopoi--session)
+    (dolist (u (gikopoi-room-users (gikopoi-ss-room gikopoi--session)))
       (when (member (gikopoi-user-raw-name u) gikopoi-auto-ignore-names)
         (setf (gikopoi-user-ignored-p u) t))))
   (message "Loaded %d auto-ignored users" (length gikopoi-auto-ignore-names)))
 
 (defun gikopoi-init-auto-ignore (&rest _)
   "Defer auto-ignore loading until the room is ready."
-  (cond ((and gikopoi-current-room (gikopoi-room-users gikopoi-current-room))
+  (cond ((and (gikopoi-ss-room gikopoi--session) (gikopoi-room-users (gikopoi-ss-room gikopoi--session)))
          (gikopoi-load-auto-ignored-users))
-        ((and gikopoi-socket (websocket-openp gikopoi-socket))
+        ((and (gikopoi-ss-socket gikopoi--session) (websocket-openp (gikopoi-ss-socket gikopoi--session)))
          (run-at-time 0.5 nil #'gikopoi-init-auto-ignore))))
 
 
@@ -2311,47 +2400,47 @@ There is no unblock in this session — reconnect to reset."
 (defvar gikopoi-quit-functions
   (list #'gikopoi-socket-close
         (lambda () (gikopoi-notif-mode -1))
-        (lambda () (setq gikopoi--stats-mode-line "") (force-mode-line-update)))
+        (lambda () (setf (gikopoi-ss-stats-mode-line gikopoi--session) "") (force-mode-line-update)))
   "Hook run when disconnecting.  Each function is called with no arguments.")
 
 (defun gikopoi-quit ()
   "Disconnect from Gikopoipoi (with confirmation)."
   (interactive)
   (when (y-or-n-p "Disconnect from Gikopoipoi? ")
-    (setq gikopoi--deliberately-quit t)
-    (when (timerp gikopoi--reconnect-timer) (cancel-timer gikopoi--reconnect-timer))
+    (setf (gikopoi-ss-deliberately-quit gikopoi--session) t)
+    (when (timerp (gikopoi-ss-reconnect-timer gikopoi--session)) (cancel-timer (gikopoi-ss-reconnect-timer gikopoi--session)))
     (run-hooks 'gikopoi-quit-functions)))
 
 (defun gikopoi-quit-silent ()
   "Disconnect silently (no confirmation; used internally by reconnect)."
-  (setq gikopoi--deliberately-quit t)
-  (when (timerp gikopoi--reconnect-timer) (cancel-timer gikopoi--reconnect-timer))
+  (setf (gikopoi-ss-deliberately-quit gikopoi--session) t)
+  (when (timerp (gikopoi-ss-reconnect-timer gikopoi--session)) (cancel-timer (gikopoi-ss-reconnect-timer gikopoi--session)))
   (run-hooks 'gikopoi-quit-functions))
 
 (defun gikopoi-reconnect ()
   "Reconnect using the same credentials as the last `gikopoi' call."
-  (when gikopoi--last-args
+  (when (gikopoi-ss-last-args gikopoi--session)
     (message "Gikopoi: reconnecting…")
-    (when gikopoi-current-room
-      (setf (nth 3 gikopoi--last-args) (gikopoi-room-id gikopoi-current-room)))
+    (when (gikopoi-ss-room gikopoi--session)
+      (setf (nth 3 (gikopoi-ss-last-args gikopoi--session)) (gikopoi-room-id (gikopoi-ss-room gikopoi--session))))
     (ignore-errors (gikopoi-quit-silent))
-    (apply #'gikopoi gikopoi--last-args)))
+    (apply #'gikopoi (gikopoi-ss-last-args gikopoi--session))))
 
-(defvar gikopoi-reconnect-timer nil)
+;; The periodic reconnect timer lives in `gikopoi--session' (see section 3).
 
 (defun gikopoi-start-reconnect-timer ()
   "Start a periodic timer that reconnects every `gikopoi-reconnect-timer-minutes' minutes."
   (interactive)
   (let ((secs (* gikopoi-reconnect-timer-minutes 60)))
-    (when gikopoi-reconnect-timer (cancel-timer gikopoi-reconnect-timer))
-    (setq gikopoi-reconnect-timer (run-at-time secs secs #'gikopoi-reconnect))
+    (when (gikopoi-ss-periodic-reconnect-timer gikopoi--session) (cancel-timer (gikopoi-ss-periodic-reconnect-timer gikopoi--session)))
+    (setf (gikopoi-ss-periodic-reconnect-timer gikopoi--session) (run-at-time secs secs #'gikopoi-reconnect))
     (message "Gikopoi: reconnect timer set for every %d min" gikopoi-reconnect-timer-minutes)))
 
 (defun gikopoi-stop-reconnect-timer ()
   (interactive)
-  (when gikopoi-reconnect-timer
-    (cancel-timer gikopoi-reconnect-timer)
-    (setq gikopoi-reconnect-timer nil)
+  (when (gikopoi-ss-periodic-reconnect-timer gikopoi--session)
+    (cancel-timer (gikopoi-ss-periodic-reconnect-timer gikopoi--session))
+    (setf (gikopoi-ss-periodic-reconnect-timer gikopoi--session) nil)
     (message "Gikopoi: reconnect timer stopped")))
 
 (defun gikopoi-maybe-start-reconnect-timer (&rest _)
@@ -2359,10 +2448,10 @@ There is no unblock in this session — reconnect to reset."
 
 (defun gikopoi-connect (server port area room name character password)
   "Establish an HTTP login and open the WebSocket to SERVER."
-  (setq gikopoi--deliberately-quit nil
+  (setf (gikopoi-ss-deliberately-quit gikopoi--session) nil
         gikopoi-room-list-data     nil)
-  (when (timerp gikopoi--reconnect-timer) (cancel-timer gikopoi--reconnect-timer))
-  (when (and gikopoi-socket (websocket-openp gikopoi-socket))
+  (when (timerp (gikopoi-ss-reconnect-timer gikopoi--session)) (cancel-timer (gikopoi-ss-reconnect-timer gikopoi--session)))
+  (when (and (gikopoi-ss-socket gikopoi--session) (websocket-openp (gikopoi-ss-socket gikopoi--session)))
     (gikopoi-socket-close))
   (let* ((version (gikopoi-api-version server))
          (login   (gikopoi-api-login server area room name character password)))
@@ -2375,9 +2464,9 @@ There is no unblock in this session — reconnect to reset."
           (format "%s %s EXPECTED_VERSION:%s ACTUAL:%s"
                   (format-time-string "%a %b %d %Y %T GMT%z") .userId
                   version .appVersion)))
-      (setq gikopoi-current-server          server
-            gikopoi-current-user-id         .userId
-            gikopoi-current-private-user-id .privateUserId)
+      (setf (gikopoi-ss-server gikopoi--session)          server
+            (gikopoi-ss-user-id gikopoi--session)         .userId
+            (gikopoi-ss-private-user-id gikopoi--session) .privateUserId)
       (gikopoi-socket-open server port .privateUserId))))
 
 
@@ -2440,7 +2529,7 @@ Each receives (server port area room name character password).")
   "Connect to a Gikopoipoi server.
 Interactively prompts for all parameters (defaults from defcustom)."
   (interactive (gikopoi-read-arglist))
-  (setq gikopoi--last-args (list server port area room name character password))
+  (setf (gikopoi-ss-last-args gikopoi--session) (list server port area room name character password))
   (run-hooks 'gikopoi-quit-functions)
   (run-hook-with-args 'gikopoi-init-functions
                       server port area room name character password))
@@ -2454,7 +2543,7 @@ Interactively prompts for all parameters (defaults from defcustom)."
   "Test HTTP round-trip latency to the current server's /api/version endpoint.
 Reports elapsed time in milliseconds in the echo area and *Messages*."
   (interactive)
-  (let ((server (or gikopoi-current-server
+  (let ((server (or (gikopoi-ss-server gikopoi--session)
                     (read-string "Server: " gikopoi-default-server))))
     (message "Gikopoi-debug: pinging %s …" server)
     (let* ((t0  (current-time))
@@ -2487,10 +2576,10 @@ One-shot: the next server-room-list reply is timed and reported."
   (interactive)
   (message
    "Gikopoi-debug: server=%s  room=%s  socket=%s  room-list-data=%s  room-list-data-count=%d"
-   (or gikopoi-current-server "nil")
-   (and gikopoi-current-room (gikopoi-room-id gikopoi-current-room))
-   (cond ((null gikopoi-socket) "nil")
-         ((websocket-openp gikopoi-socket) "open")
+   (or (gikopoi-ss-server gikopoi--session) "nil")
+   (and (gikopoi-ss-room gikopoi--session) (gikopoi-room-id (gikopoi-ss-room gikopoi--session)))
+   (cond ((null (gikopoi-ss-socket gikopoi--session)) "nil")
+         ((websocket-openp (gikopoi-ss-socket gikopoi--session)) "open")
          (t "closed"))
    (if gikopoi-room-list-data "loaded" "nil")
    (length gikopoi-room-list-data)))
@@ -2498,7 +2587,7 @@ One-shot: the next server-room-list reply is timed and reported."
 (defun gikopoi-debug-room-list ()
   "Send user-room-list and dump the raw server response to *Gikopoi Room List Debug*."
   (interactive)
-  (unless (and gikopoi-socket (websocket-openp gikopoi-socket))
+  (unless (and (gikopoi-ss-socket gikopoi--session) (websocket-openp (gikopoi-ss-socket gikopoi--session)))
     (user-error "Gikopoi: not connected"))
   (let ((buf (get-buffer-create "*Gikopoi Room List Debug*"))
         (orig (get 'server-room-list 'gikopoi-event-handler)))
