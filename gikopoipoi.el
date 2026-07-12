@@ -127,6 +127,20 @@
   "Period in minutes for the optional periodic reconnect timer."
   :group 'gikopoi :type 'natnum)
 
+(defcustom gikopoi-restore-position-on-reconnect t
+  "If non-nil, walk back to your last tile after a full re-login.
+Most reconnects are a lightweight resume (see `gikopoi-reconnect') that
+the server answers with your exact previous tile, so no walking is
+needed. This only matters for the fallback case — a full HTTP re-login,
+which always spawns at the room's default entry tile — where the tile
+you were standing on is remembered and the client auto-walks you back
+there once the room reloads, along a shortest path around walls."
+  :group 'gikopoi :type 'boolean)
+
+(defcustom gikopoi-walk-step-interval 0.35
+  "Seconds between successive moves while auto-walking back to a saved tile."
+  :group 'gikopoi :type 'number)
+
 (defcustom gikopoi-auto-clear-bubble nil
   "If non-nil, automatically send a blank message to clear your speech bubble after chatting."
   :group 'gikopoi :type 'boolean)
@@ -172,13 +186,16 @@ Reconnect machinery:
   RECONNECT-TIMER   pending exponential-back-off reconnect timer
   RECONNECT-DELAY   current back-off delay in seconds
   LAST-ARGS         args from the last `gikopoi' call, reused on reconnect
-  PERIODIC-RECONNECT-TIMER  the every-N-minutes reconnect timer"
+  PERIODIC-RECONNECT-TIMER  the every-N-minutes reconnect timer
+  SAVED-POSITION    (X . Y) tile to walk back to after a reconnect
+  SAVED-ROOM        room id SAVED-POSITION belongs to"
   server user-id private-user-id user room room-loading-p rooms
   (user-count 0) (stream-count 0) (stats-mode-line "")
   socket socket-interval (socket-tolerance 1) socket-ping-timer socket-timeout
   reconnecting-p
   deliberately-quit reconnect-timer (reconnect-delay 5) last-args
-  periodic-reconnect-timer)
+  periodic-reconnect-timer
+  saved-position saved-room)
 
 (defvar gikopoi--session (gikopoi--make-session)
   "The singleton `gikopoi-session' holding all connection-level state.")
@@ -384,6 +401,40 @@ Reconnect machinery:
                          (message "Gikopoi: room list parse error: %s"
                                   (error-message-string err))))))
                   nil :silent :inhibit-cookies)))
+
+(defun gikopoi--room-list-fetch-synchronously ()
+  "Fetch the room list via REST API and block until it's applied.
+Unlike `gikopoi-room-list-request' (fire-and-forget, for the tabulated
+room-list buffer's own revert cycle), this is for callers like
+`gikopoi-rula' that need `gikopoi-room-list-data' to reflect the
+current [num] counts *before* they build a candidate list — otherwise
+the counts shown are whatever was cached from the last fetch, which
+goes stale after people move between rooms or after a reconnect.
+Returns `gikopoi-room-list-data', or the previous (stale) value with a
+message if the request fails or times out, so `gikopoi-rula' still has
+something to show while disconnected."
+  (let* ((server (or (gikopoi-ss-server gikopoi--session) "gikopoipoi.net"))
+         (area   (or (nth 2 (gikopoi-ss-last-args gikopoi--session)) gikopoi-default-area "for"))
+         (pid    (gikopoi-ss-private-user-id gikopoi--session))
+         (url    (format "https://%s/api/areas/%s/rooms" server area))
+         (url-request-method "GET")
+         (url-request-extra-headers
+          (when pid `(("Authorization" . ,(format "Bearer %s" pid))))))
+    (condition-case err
+        (let ((buf (url-retrieve-synchronously url :silent :inhibit-cookies 5)))
+          (unless buf (error "no response"))
+          (unwind-protect
+              (with-current-buffer buf
+                (goto-char (point-min))
+                (re-search-forward "\r?\n\r?\n" nil t)
+                (gikopoi--on-room-list (json-parse-buffer
+                                        :array-type  'list
+                                        :object-type 'alist)))
+            (kill-buffer buf)))
+      (error
+       (message "Gikopoi: room list fetch failed (%s); showing last known counts"
+                (error-message-string err)))))
+  gikopoi-room-list-data)
 
 (defun gikopoi-user-ping ()
   (gikopoi-socket-emit "user-ping"))
@@ -680,6 +731,13 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
                (not (buffer-live-p (gikopoi-mv-buffer gikopoi--map))))
       (run-at-time 0.5 nil (lambda ()
                              (when (gikopoi-ss-room gikopoi--session) (gikopoi-show-map)))))
+    ;; If we just reconnected, walk back to the tile we were on (one-shot).
+    (when-let ((saved (gikopoi-ss-saved-position gikopoi--session)))
+      (let ((same-room (equal (gikopoi-ss-saved-room gikopoi--session) new-id)))
+        (setf (gikopoi-ss-saved-position gikopoi--session) nil
+              (gikopoi-ss-saved-room gikopoi--session) nil)
+        (when (and gikopoi-restore-position-on-reconnect same-room)
+          (run-at-time 0.6 nil (lambda () (gikopoi--walk-to saved))))))
     (gikopoi--refresh-map-buffer)))
 
 (gikopoi-defevent server-update-current-room-streams (streams)
@@ -720,7 +778,8 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
                  old (not (equal old (cons x y)))
                  (gikopoi--map-anim-visible-p))
         (gikopoi--map-start-walk userId old))
-      (gikopoi--refresh-map-buffer))))
+      (gikopoi--refresh-map-buffer)
+      (gikopoi--refresh-user-list-buffer))))
 
 (gikopoi-defevent server-bubble-position (id direction)
   (when-let ((u (gikopoi-user-by-id id)))
@@ -775,7 +834,13 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
 (gikopoi-defevent server-ok-to-stream ())
 (gikopoi-defevent server-not-ok-to-stream (_reason))
 (gikopoi-defevent server-not-ok-to-take-stream (_slot))
-(gikopoi-defevent server-cant-log-you-in ())
+(gikopoi-defevent server-cant-log-you-in ()
+  ;; The server didn't recognize our private-user-id — this is the reply to
+  ;; a lightweight socket-only resume (see `gikopoi-reconnect') when the
+  ;; server no longer has a "ghost" for us (session >30min old, or the
+  ;; server restarted). Fall back to a full HTTP re-login.
+  (message "Gikopoi: session expired — doing a full re-login")
+  (gikopoi--full-relogin))
 (gikopoi-defevent server-update-chessboard (_state))
 (gikopoi-defevent server-update-janken (_state))
 (gikopoi-defevent server-chess-win (_id))
@@ -1033,6 +1098,9 @@ Requests a fresh room list from the server first."
                   (vector (gikopoi-user-name u)
                           (concat (if (gikopoi-user-active-p  u) "" "z")
                                   (if (gikopoi-user-ignored-p u) "I" ""))
+                          (if-let ((p (gikopoi-user-position u)))
+                              (format "%s,%s" (car p) (cdr p))
+                            "")
                           (or (gikopoi-user-last-message u) ""))))
           (gikopoi-room-users (gikopoi-ss-room gikopoi--session))))
 
@@ -1046,7 +1114,7 @@ Requests a fresh room list from the server first."
   (with-current-buffer gikopoi-user-list-buffer
     (tabulated-list-mode)
     (setq tabulated-list-format
-          [("Name" 20 t) ("St" 2 nil) ("Last Message" 0 nil)])
+          [("Name" 20 t) ("St" 2 nil) ("XY" 7 nil) ("Last Message" 0 nil)])
     (tabulated-list-init-header)
     (add-hook 'tabulated-list-revert-hook
               (lambda () (setq tabulated-list-entries (gikopoi--user-list-entries)))
@@ -1231,6 +1299,117 @@ a door or warp — stays visible even with people stacked on it."
                           (insert (gikopoi--map-cell x y blocked sit doors users)))
                  (insert "\n"))
         (insert (gikopoi--map-legend))))))
+
+;;; ── 16b′. Auto-Walk (return to a saved tile) ──────────────────────────────
+;;;
+;;; A small reactive path-walker: given a target tile it emits one `user-move'
+;;; per tick toward the target, recomputing a shortest path (BFS around walls)
+;;; from the server-confirmed position each step, so it self-corrects and stops
+;;; cleanly if the way is blocked.  Used to restore your position after a
+;;; reconnect (see `gikopoi-restore-position-on-reconnect').
+
+(defconst gikopoi--move-deltas
+  '(("up" . (0 . 1)) ("down" . (0 . -1)) ("left" . (-1 . 0)) ("right" . (1 . 0)))
+  "Grid delta (DX . DY) applied by each `user-move' DIRECTION.")
+
+(defvar gikopoi--walk-target nil "Target (X . Y) the auto-walker is heading to, or nil.")
+(defvar gikopoi--walk-timer nil "Repeating timer driving the auto-walker.")
+(defvar gikopoi--walk-tries 0 "Moves emitted so far on the current walk (a safety bound).")
+(defvar gikopoi--walk-moved nil "Non-nil once the current walk has emitted a move.")
+(defvar gikopoi--walk-settle 0
+  "Ticks left to wait for the server to settle our spawn before concluding arrival.
+After a reconnect the server first echoes our old tile in the room state, then
+relocates us to the entrance door a beat later.  We hold off declaring \"arrived\"
+until either this counter runs out or our position actually changes.")
+(defvar gikopoi-walk-max-steps 400
+  "Hard cap on moves for one auto-walk, so a bad path can never loop forever.")
+
+(defun gikopoi--self-user ()
+  "Return our own `gikopoi-user' in the current room, resolved live by id.
+Falls back to the session's cached USER.  Resolving by id each tick avoids
+acting on a stale object left over from before a reconnect."
+  (or (and (gikopoi-ss-user-id gikopoi--session)
+           (gikopoi-user-by-id (gikopoi-ss-user-id gikopoi--session)))
+      (gikopoi-ss-user gikopoi--session)))
+
+(defun gikopoi--walk-next-dir (from to)
+  "Return the DIRECTION string for the first step of a shortest FROM->TO path.
+Paths run over in-bounds, non-blocked tiles of the current room.  Returns nil
+if TO is unreachable or the room has no map."
+  (when-let ((dim (gikopoi--map-dimensions)))
+    (let* ((w       (car dim))
+           (h       (cdr dim))
+           (blocked (gikopoi--coords->set (alist-get 'blocked (gikopoi--room-assets))))
+           (came    (make-hash-table :test 'equal))
+           (queue   (list from)))
+      (puthash from t came)
+      (catch 'done
+        (while queue
+          (let ((cur (pop queue)))
+            (when (equal cur to) (throw 'done nil))
+            (dolist (d gikopoi--move-deltas)
+              (let* ((delta (cdr d))
+                     (nx    (+ (car cur) (car delta)))
+                     (ny    (+ (cdr cur) (cdr delta)))
+                     (np    (cons nx ny)))
+                (unless (or (< nx 0) (< ny 0) (>= nx w) (>= ny h)
+                            (gethash np blocked) (gethash np came))
+                  (puthash np (cons cur (car d)) came)
+                  (setq queue (nconc queue (list np)))))))))
+      ;; Walk the parent chain back to FROM; the last direction is the first step.
+      (let ((node to) (first-dir nil))
+        (while (and (consp (gethash node came)) (not (equal node from)))
+          (let ((pd (gethash node came)))
+            (setq first-dir (cdr pd)
+                  node      (car pd))))
+        (and (equal node from) first-dir)))))
+
+(defun gikopoi-walk-stop ()
+  "Cancel any in-progress auto-walk."
+  (interactive)
+  (when (timerp gikopoi--walk-timer) (cancel-timer gikopoi--walk-timer))
+  (setq gikopoi--walk-timer nil gikopoi--walk-target nil
+        gikopoi--walk-tries 0 gikopoi--walk-moved nil gikopoi--walk-settle 0))
+
+(defun gikopoi--walk-step ()
+  "One tick of the auto-walker: step toward `gikopoi--walk-target' or stop."
+  (let* ((me     (gikopoi--self-user))
+         (pos    (and me (gikopoi-user-position me)))
+         (target gikopoi--walk-target))
+    (cond
+     ((or (null target) (null pos)
+          (not (and (gikopoi-ss-socket gikopoi--session)
+                    (websocket-openp (gikopoi-ss-socket gikopoi--session)))))
+      (gikopoi-walk-stop))
+     ((equal pos target)
+      ;; We appear to be there.  Right after a reconnect the server may still
+      ;; relocate us to the door, so if we haven't moved yet wait out the settle
+      ;; window before believing it.
+      (if (and (not gikopoi--walk-moved) (> gikopoi--walk-settle 0))
+          (setq gikopoi--walk-settle (1- gikopoi--walk-settle))
+        (gikopoi-walk-stop)
+        (message "Gikopoi: back at (%s,%s)" (car target) (cdr target))))
+     ((> (setq gikopoi--walk-tries (1+ gikopoi--walk-tries)) gikopoi-walk-max-steps)
+      (gikopoi-walk-stop)
+      (message "Gikopoi: gave up walking back to (%s,%s)" (car target) (cdr target)))
+     (t (let ((dir (gikopoi--walk-next-dir pos target)))
+          (if dir
+              (progn (setq gikopoi--walk-moved t)
+                     (ignore-errors (gikopoi-move dir)))
+            (gikopoi-walk-stop)
+            (message "Gikopoi: no path back to (%s,%s)" (car target) (cdr target))))))))
+
+(defun gikopoi--walk-to (target)
+  "Begin auto-walking to TARGET, a (X . Y) tile in the current room."
+  (gikopoi-walk-stop)
+  (when (and target (gikopoi--self-user))
+    (setq gikopoi--walk-target target
+          gikopoi--walk-tries  0
+          gikopoi--walk-moved  nil
+          ;; ~1.5s of grace for the post-reconnect spawn to settle.
+          gikopoi--walk-settle (max 1 (round (/ 1.5 (max 0.1 gikopoi-walk-step-interval))))
+          gikopoi--walk-timer
+          (run-at-time 0.1 (max 0.1 gikopoi-walk-step-interval) #'gikopoi--walk-step))))
 
 ;;; ── 16c. Graphical Map ────────────────────────────────────────────────────
 ;;;
@@ -2251,8 +2430,7 @@ Called with a string (e.g. via #rula) warps directly to that room ID."
   (interactive
    (list
     (progn
-      (when (null gikopoi-room-list-data)
-        (gikopoi-room-list-request))
+      (gikopoi--room-list-fetch-synchronously)
       (let* ((candidates
               (mapcar (lambda (e)
                         (let* ((count (aref (cadr e) 2))
@@ -2417,14 +2595,50 @@ There is no unblock in this session — reconnect to reset."
   (when (timerp (gikopoi-ss-reconnect-timer gikopoi--session)) (cancel-timer (gikopoi-ss-reconnect-timer gikopoi--session)))
   (run-hooks 'gikopoi-quit-functions))
 
+(defun gikopoi--full-relogin ()
+  "Reconnect via a full HTTP re-login (fresh private-user-id, fresh spawn).
+This is the fallback used when a lightweight resume isn't possible or was
+refused by the server (see `gikopoi-reconnect' and `server-cant-log-you-in').
+Since a fresh login always spawns at the room's default entry tile rather
+than wherever we actually were, we remember our tile here and walk back to
+it once the new room state settles (see `server-update-current-room-state'
+and `gikopoi-restore-position-on-reconnect')."
+  (when (gikopoi-ss-room gikopoi--session)
+    (setf (nth 3 (gikopoi-ss-last-args gikopoi--session)) (gikopoi-room-id (gikopoi-ss-room gikopoi--session))))
+  (when-let ((me (and gikopoi-restore-position-on-reconnect
+                      (gikopoi-ss-user gikopoi--session))))
+    (setf (gikopoi-ss-saved-position gikopoi--session) (gikopoi-user-position me)
+          (gikopoi-ss-saved-room gikopoi--session)
+          (and (gikopoi-ss-room gikopoi--session)
+               (gikopoi-room-id (gikopoi-ss-room gikopoi--session)))))
+  (ignore-errors (gikopoi-quit-silent))
+  (apply #'gikopoi (gikopoi-ss-last-args gikopoi--session)))
+
 (defun gikopoi-reconnect ()
-  "Reconnect using the same credentials as the last `gikopoi' call."
+  "Reconnect using the same credentials as the last `gikopoi' call.
+Tries a lightweight resume first: reopen the raw WebSocket reusing our
+existing private-user-id, the same thing the official web client's
+socket.io auto-reconnect does. The server keeps a disconnected player (a
+\"ghost\") alive together with its room and exact tile for a while after
+the socket drops, so this restores our position exactly with no
+client-side walking involved. If the server has since forgotten that
+private-user-id (session expired, or the server restarted) it replies
+with `server-cant-log-you-in', which falls back to `gikopoi--full-relogin'.
+When we don't yet have a private-user-id at all (e.g. we never
+successfully connected), that fallback runs directly."
   (when (gikopoi-ss-last-args gikopoi--session)
     (message "Gikopoi: reconnecting…")
-    (when (gikopoi-ss-room gikopoi--session)
-      (setf (nth 3 (gikopoi-ss-last-args gikopoi--session)) (gikopoi-room-id (gikopoi-ss-room gikopoi--session))))
-    (ignore-errors (gikopoi-quit-silent))
-    (apply #'gikopoi (gikopoi-ss-last-args gikopoi--session))))
+    (if-let ((server (gikopoi-ss-server gikopoi--session))
+             (pid    (gikopoi-ss-private-user-id gikopoi--session)))
+        (let ((port (nth 1 (gikopoi-ss-last-args gikopoi--session))))
+          (setf (gikopoi-ss-deliberately-quit gikopoi--session) nil)
+          (when (timerp (gikopoi-ss-reconnect-timer gikopoi--session))
+            (cancel-timer (gikopoi-ss-reconnect-timer gikopoi--session)))
+          (when (and (gikopoi-ss-socket gikopoi--session)
+                     (websocket-openp (gikopoi-ss-socket gikopoi--session)))
+            (gikopoi-socket-close))
+          (gikopoi-socket-open server port pid))
+      (gikopoi--full-relogin))))
 
 ;; The periodic reconnect timer lives in `gikopoi--session' (see section 3).
 
