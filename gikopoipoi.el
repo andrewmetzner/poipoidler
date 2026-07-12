@@ -1206,8 +1206,9 @@ entry (e.g. `floor', `blocked') get no colour block."
 
 (defun gikopoi--map-user-glyph (users)
   "Return the propertized avatar glyph for the USERS on a single tile."
-  (let* ((you   (memq (gikopoi-ss-user gikopoi--session) users))
-         (u     (if you (gikopoi-ss-user gikopoi--session) (car users)))
+  (let* ((me    (gikopoi--self-user))
+         (you   (memq me users))
+         (u     (if you me (car users)))
          (names (mapconcat #'gikopoi-user-raw-name users ", ")))
     (cond
      (you (propertize (gikopoi--map-arrow (gikopoi-user-direction u))
@@ -1288,11 +1289,11 @@ a door or warp — stays visible even with people stacked on it."
         (insert (propertize (format "%s  (%d×%d)\n"
                                      (gikopoi-room-id (gikopoi-ss-room gikopoi--session)) w h)
                             'face 'bold))
-        (when-let ((p (and (gikopoi-ss-user gikopoi--session)
-                           (gikopoi-user-position (gikopoi-ss-user gikopoi--session)))))
+        (when-let* ((me (gikopoi--self-user))
+                    (p  (gikopoi-user-position me)))
           (insert (format "you: (%s,%s) facing %s\n"
                           (car p) (cdr p)
-                          (gikopoi-user-direction (gikopoi-ss-user gikopoi--session)))))
+                          (gikopoi-user-direction me))))
         (insert "\n")
         (cl-loop for y from (1- h) downto 0 do
                  (cl-loop for x from 0 below w do
@@ -1737,7 +1738,7 @@ When WALKING, alternate the two walk frames according to PHASE."
 (defun gikopoi--current-user-feet ()
   "Return the local user's feet position (CX . FY) in background pixels, or nil.
 Uses the animated position while walking so the camera follows smoothly."
-  (when-let ((u (gikopoi-ss-user gikopoi--session))
+  (when-let ((u (gikopoi--self-user))
              (pos (gikopoi-user-position u)))
     (let ((e (gethash (gikopoi-user-id u) (gikopoi-mv-anim gikopoi--map))))
       (if (and e (plist-get e :walking))
@@ -2040,7 +2041,7 @@ the same offsets the JS client uses."
                    (let ((label (substring-no-properties (or (gikopoi-user-name u) ""))))
                      (unless (string-empty-p label)
                        (push (gikopoi--name-tag-el
-                              label cx top (eq u (gikopoi-ss-user gikopoi--session)))
+                              label cx top (eq u (gikopoi--self-user)))
                              parts))))
                  ;; speech bubble — persists as long as the user keeps the message
                  (when gikopoi-map-show-bubbles
