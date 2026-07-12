@@ -762,11 +762,15 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
 
 (gikopoi-defevent server-user-active (id)
   (when-let ((u (gikopoi-user-by-id id)))
-    (setf (gikopoi-user-active-p u) t)))
+    (setf (gikopoi-user-active-p u) t)
+    (gikopoi--refresh-user-list-buffer)
+    (gikopoi--refresh-map-buffer)))
 
 (gikopoi-defevent server-user-inactive (id)
   (when-let ((u (gikopoi-user-by-id id)))
-    (setf (gikopoi-user-active-p u) nil)))
+    (setf (gikopoi-user-active-p u) nil)
+    (gikopoi--refresh-user-list-buffer)
+    (gikopoi--refresh-map-buffer)))
 
 (gikopoi-defevent server-move ((userId x y direction lastMovement isInstant shouldSpinwalk))
   (when-let ((u (gikopoi-user-by-id userId)))
@@ -2481,7 +2485,7 @@ Called with a string (e.g. via #rula) warps directly to that room ID."
 
 (defun gikopoi-ignore (name)
   "Toggle client-side ignore for NAME.  Their messages are hidden locally only."
-  (interactive (list (completing-read "Ignore/unignore user: " (gikopoi-user-names))))
+  (interactive (list (read-from-minibuffer "Ignore/unignore user: " nil gikopoi-minibuffer-map)))
   (when-let ((u (gikopoi-user-by-name name)))
     (setf (gikopoi-user-ignored-p u) (not (gikopoi-user-ignored-p u)))
     (when (called-interactively-p 'interactive)
@@ -2493,7 +2497,7 @@ Called with a string (e.g. via #rula) warps directly to that room ID."
   "Block NAME server-side.  The server removes mutual visibility immediately.
 This is stronger than ignore: neither you nor the blocked user can see each other.
 There is no unblock in this session — reconnect to reset."
-  (interactive (list (completing-read "Block user: " (gikopoi-user-names))))
+  (interactive (list (read-from-minibuffer "Block user: " nil gikopoi-minibuffer-map)))
   (when-let ((u (gikopoi-user-by-name name)))
     (let ((uid (gikopoi-user-id u)))
       (setf (gikopoi-user-ignored-p u) t)
