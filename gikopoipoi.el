@@ -119,6 +119,11 @@
   "Maximum seconds between auto-reconnect attempts (doubles each failure)."
   :group 'gikopoi :type 'natnum)
 
+(defcustom gikopoi-reconnect-max-attempts 10
+  "Give up auto-reconnecting after this many consecutive failures.
+Set to 0 to retry forever."
+  :group 'gikopoi :type 'natnum)
+
 (defcustom gikopoi-auto-start-reconnect-timer nil
   "If non-nil, start the periodic reconnect timer on connect."
   :group 'gikopoi :type 'boolean)
@@ -185,6 +190,7 @@ Reconnect machinery:
   DELIBERATELY-QUIT non-nil when the user asked to disconnect
   RECONNECT-TIMER   pending exponential-back-off reconnect timer
   RECONNECT-DELAY   current back-off delay in seconds
+  RECONNECT-ATTEMPTS  consecutive failed reconnects since the last success
   LAST-ARGS         args from the last `gikopoi' call, reused on reconnect
   PERIODIC-RECONNECT-TIMER  the every-N-minutes reconnect timer
   SAVED-POSITION    (X . Y) tile to walk back to after a reconnect
@@ -193,7 +199,7 @@ Reconnect machinery:
   (user-count 0) (stream-count 0) (stats-mode-line "")
   socket socket-interval (socket-tolerance 1) socket-ping-timer socket-timeout
   reconnecting-p
-  deliberately-quit reconnect-timer (reconnect-delay 5) last-args
+  deliberately-quit reconnect-timer (reconnect-delay 5) (reconnect-attempts 0) last-args
   periodic-reconnect-timer
   saved-position saved-room)
 
@@ -303,24 +309,40 @@ Reconnect machinery:
 
 ;; Socket and reconnect state live in `gikopoi--session' (see section 3).
 
-(defun gikopoi--schedule-reconnect (delay)
-  "Schedule a full re-login + reconnect in DELAY seconds, with exponential back-off."
+(defun gikopoi--schedule-reconnect ()
+  "Schedule the next reconnect attempt, backing off exponentially.
+Gives up (leaving the connection dead until a manual `gikopoi-reconnect')
+once `gikopoi-reconnect-max-attempts' consecutive failures have occurred."
   (when (timerp (gikopoi-ss-reconnect-timer gikopoi--session))
     (cancel-timer (gikopoi-ss-reconnect-timer gikopoi--session)))
-  (when (buffer-live-p gikopoi-message-buffer)
-    (gikopoi-with-message-buffer
-      (insert (format "%s* disconnected — retrying in %ds\n"
-                      (format-time-string gikopoi-msg-time-format) delay))))
-  (setf (gikopoi-ss-reconnect-delay gikopoi--session) delay
-        (gikopoi-ss-reconnect-timer gikopoi--session)
-        (run-at-time delay nil
-                     (lambda ()
-                       (condition-case err
-                           (gikopoi-reconnect)
-                         (error
-                          (gikopoi--schedule-reconnect
-                           (min (* (gikopoi-ss-reconnect-delay gikopoi--session) 2)
-                                gikopoi-reconnect-max-delay))))))))
+  (cl-incf (gikopoi-ss-reconnect-attempts gikopoi--session))
+  (if (and (> gikopoi-reconnect-max-attempts 0)
+           (> (gikopoi-ss-reconnect-attempts gikopoi--session)
+              gikopoi-reconnect-max-attempts))
+      (when (buffer-live-p gikopoi-message-buffer)
+        (gikopoi-with-message-buffer
+          (insert (format "%s* giving up after %d failed reconnect attempts — use M-x gikopoi-reconnect to try again\n"
+                          (format-time-string gikopoi-msg-time-format)
+                          gikopoi-reconnect-max-attempts))))
+    (let ((delay (gikopoi-ss-reconnect-delay gikopoi--session)))
+      (when (buffer-live-p gikopoi-message-buffer)
+        (gikopoi-with-message-buffer
+          (insert (format "%s* disconnected — retrying in %ds (attempt %d%s)\n"
+                          (format-time-string gikopoi-msg-time-format) delay
+                          (gikopoi-ss-reconnect-attempts gikopoi--session)
+                          (if (> gikopoi-reconnect-max-attempts 0)
+                              (format "/%d" gikopoi-reconnect-max-attempts)
+                            "")))))
+      (setf (gikopoi-ss-reconnect-delay gikopoi--session)
+            (min (* delay 2) gikopoi-reconnect-max-delay)
+            (gikopoi-ss-reconnect-timer gikopoi--session)
+            (run-at-time delay nil
+                         (lambda ()
+                           (condition-case err
+                               (gikopoi-reconnect)
+                             (error
+                              (message "Gikopoi: reconnect error: %s" (error-message-string err))
+                              (gikopoi--schedule-reconnect)))))))))
 
 ;;; WebSocket open / close
 
@@ -341,7 +363,7 @@ Reconnect machinery:
                          (cancel-timer (gikopoi-ss-socket-ping-timer gikopoi--session)))
                        (when (and gikopoi-auto-reconnect
                                   (not (gikopoi-ss-deliberately-quit gikopoi--session)))
-                         (gikopoi--schedule-reconnect 5)))
+                         (gikopoi--schedule-reconnect)))
          :on-message #'gikopoi--ws-message-handler))
   (setf (websocket-client-data (gikopoi-ss-socket gikopoi--session)) (list server port pid))
   (gikopoi-ss-socket gikopoi--session))
@@ -466,7 +488,7 @@ something to show while disconnected."
                                 nil
                                 (lambda ()
                                   (unless (gikopoi-ss-deliberately-quit gikopoi--session)
-                                    (gikopoi--schedule-reconnect 5))))))
+                                    (gikopoi--schedule-reconnect))))))
             (40 nil) ; socket.io connect ack
             (42 (when (vectorp payload) (gikopoi--dispatch-event payload)))
             (_  nil)))) ; unknown id – silently ignore
@@ -698,6 +720,8 @@ ARGS may include (KEY …) forms that destructure a single alist argument."
 ;;; Room events
 
 (gikopoi-defevent server-update-current-room-state ((currentRoom connectedUsers streams))
+  (setf (gikopoi-ss-reconnect-attempts gikopoi--session) 0
+        (gikopoi-ss-reconnect-delay gikopoi--session) 5)
   (let ((prev-id (and (gikopoi-ss-room gikopoi--session)
                       (gikopoi-room-id (gikopoi-ss-room gikopoi--session))))
         (new-id  (alist-get 'id currentRoom)))
@@ -2631,6 +2655,9 @@ private-user-id (session expired, or the server restarted) it replies
 with `server-cant-log-you-in', which falls back to `gikopoi--full-relogin'.
 When we don't yet have a private-user-id at all (e.g. we never
 successfully connected), that fallback runs directly."
+  (interactive)
+  (setf (gikopoi-ss-reconnect-attempts gikopoi--session) 0
+        (gikopoi-ss-reconnect-delay gikopoi--session) 5)
   (when (gikopoi-ss-last-args gikopoi--session)
     (message "Gikopoi: reconnecting…")
     (if-let ((server (gikopoi-ss-server gikopoi--session))
